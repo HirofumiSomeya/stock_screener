@@ -109,18 +109,42 @@ print(f"\nスクリーニング通過: {len(passed_tickers)} 社")
 if not uptrend_data:
     print("条件を満たす銘柄がありませんでした。日経平均などの地合いを確認してください。")
 else:
-    print("\n第2段階: 通過した有望銘柄のファンダメンタル情報を取得しています...")
+    print(f"\n第2段階: 通過した有望銘柄のファンダメンタル情報を取得しています...")
     fund_data = []
+    
     for ticker in tqdm(passed_tickers):
-        try:
-            info = yf.Ticker(ticker).info
+        success = False
+        info = {}
+        
+        # 401エラーを防ぐためのリトライ＆ウェイト処理
+        for attempt in range(3):
+            try:
+                # yf.Tickerを安全に取得
+                stock_obj = yf.Ticker(ticker)
+                info = stock_obj.info
+                success = True
+                break
+            except Exception as e:
+                # エラー時は少し長めに待機してリトライ (2秒, 4秒, 6秒)
+                time.sleep(2 * (attempt + 1))
+        
+        if success and info:
+            fund_data.info = info # ダミーではなく正しく辞書に格納
             fund_data.append({
                 'Ticker': ticker,
                 'PER': info.get('trailingPE', np.nan),
                 'PBR': info.get('priceToBook', np.nan)
             })
-        except:
-            pass
+        else:
+            # 取得に失敗した場合はNaNを入れて継続
+            fund_data.append({
+                'Ticker': ticker,
+                'PER': np.nan,
+                'PBR': np.nan
+            })
+            
+        # 銘柄ごとの取得合間にランダムなウェイトを挟み、サーバー負荷を大きく下げる
+        time.sleep(1.0)
             
     fund_df = pd.DataFrame(fund_data)
     
