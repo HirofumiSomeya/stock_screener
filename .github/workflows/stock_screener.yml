@@ -27,7 +27,7 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install yfinance pandas numpy lightgbm tqdm requests openpyxl
+        pip install --upgrade yfinance pandas numpy lightgbm scikit-learn tqdm requests openpyxl
 
     # 4. スクリプトの実行（ファイル名を main.py と仮定しています）
     - name: Run Python Script
