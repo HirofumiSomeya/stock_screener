@@ -6,6 +6,7 @@ from tqdm import tqdm
 import time
 import warnings
 import os
+import random
 from datetime import datetime
 warnings.filterwarnings('ignore')
 
@@ -31,13 +32,25 @@ uptrend_data = []
 latest_features = []
 passed_tickers = []
 
-chunk_size = 50
+chunk_size = 30  # 一度に取得する数を少し小さめ（例: 30）にして負荷を軽減する
 for i in tqdm(range(0, len(valid_tickers), chunk_size)):
     chunk = valid_tickers[i:i + chunk_size]
     
-    try:
-        bulk_data = yf.download(chunk, period="2y", interval="1d", progress=False, group_by='ticker')
+    # 401エラーを防ぐためのリトライ＆ウェイト処理
+    success = False
+    for attempt in range(3): # 最大3回までリトライ
+        try:
+            bulk_data = yf.download(chunk, period="2y", interval="1d", progress=False, group_by='ticker')
+            success = True
+            break
+        except Exception as e:
+            time.sleep(3 * (attempt + 1)) # 失敗するごとに待機時間を伸ばす (3秒, 6秒, 9秒)
+            
+    if not success:
+        time.sleep(5)
+        continue
         
+    try:
         for ticker in chunk:
             if len(chunk) == 1:
                 df = bulk_data.copy()
@@ -73,8 +86,6 @@ for i in tqdm(range(0, len(valid_tickers), chunk_size)):
             delta = df['Close'].diff()
             gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-            
-            # RSIの計算
             df['RSI'] = 100 - (100 / (1 + gain / loss))
             
             df['Target'] = (df['Close'].shift(-1) > df['Close']).astype(int)
@@ -88,8 +99,10 @@ for i in tqdm(range(0, len(valid_tickers), chunk_size)):
             passed_tickers.append(ticker)
             
     except Exception as e:
-        time.sleep(2)
         continue
+        
+    # チャンク処理の合間にランダムなウェイト（1.5秒〜3秒）を挟んでボット判定を回避
+    time.sleep(random.uniform(1.5, 3.0))
 
 print(f"\nスクリーニング通過: {len(passed_tickers)} 社")
 
