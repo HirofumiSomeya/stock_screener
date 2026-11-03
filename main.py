@@ -192,53 +192,67 @@ else:
               f"{row['PER_Str']:<6} {row['PBR_Str']:<6} {row['TP_Str']:<14} {row['SL_Str']:<14}")
     print("="*85)
 
-# --- 【機能追加】予測結果の蓄積と検証システム ---
-history_file = 'ai_prediction_history.csv'
-today_str = datetime.now().strftime('%Y-%m-%d')
-
-# 1. 本日のランキング上位15銘柄のデータを抽出してログ用データフレームを作成
-today_log = ranking.head(15).copy()
-today_log['Date'] = today_str
-today_log['Actual_Close_Next'] = np.nan 
-today_log['Is_Hit'] = np.nan            
-
-# 2. 過去の履歴ファイルが存在する場合、過去データの「答え合わせ」を試みる
-if os.path.exists(history_file):
-    history_df = pd.read_csv(history_file)
+    # ※ここは else: ブロックの中（先頭にスペース4つ）に配置します
     
-    mask = history_df['Actual_Close_Next'].isna()
-    if mask.sum() > 0:
-        print("\n過去の予測結果の検証（答え合わせ）を実行中...")
-        for idx, row in history_df[mask].iterrows():
-            ticker = row['Ticker']
-            pred_date = row['Date']
-            base_close = row['Close']
-            
-            try:
-                df_check = yf.download(ticker, start=pred_date, progress=False)
-                if isinstance(df_check.columns, pd.MultiIndex):
-                    df_check.columns = df_check.columns.droplevel(1)
-                
-                if len(df_check) > 1:
-                    next_close = df_check.iloc[1]['Close']
-                    history_df.loc[idx, 'Actual_Close_Next'] = next_close
-                    
-                    is_hit = 1 if next_close > base_close else 0
-                    history_df.loc[idx, 'Is_Hit'] = is_hit
-            except:
-                pass
-                
-        history_df.to_csv(history_file, index=False)
+    # 0. 最新ランキングのCSV保存（git add のエラーを防ぐため必須）
+    save_cols = ['Ticker', 'Close', 'AI_Win_Probability', 'PER', 'PBR', 'Target_Buy', 'Take_Profit', 'Stop_Loss']
+    ranking[save_cols].to_csv('ai_ranking_with_prices.csv', index=False)
+    print("\n📁 最新ランキングを 'ai_ranking_with_prices.csv' に保存しました。")
+
+    # --- 予測結果の蓄積と検証システム ---
+    history_file = 'ai_prediction_history.csv'
+    today_str = datetime.now().strftime('%Y-%m-%d')
+
+    # 1. 必要な数値カラムだけを抽出してログ用データフレームを作成
+    today_log = ranking[save_cols].head(15).copy()
+    today_log['Date'] = today_str
+    today_log['Actual_Close_Next'] = np.nan 
+    today_log['Is_Hit'] = np.nan            
+
+    # 2. 過去の履歴ファイルが存在する場合、過去データの「答え合わせ」を試みる
+    if os.path.exists(history_file):
+        history_df = pd.read_csv(history_file)
         
+        # 答え合わせが未完了、かつ「今日より前の日付」のレコードをチェック
+        mask = history_df['Actual_Close_Next'].isna() & (history_df['Date'] < today_str)
+        if mask.sum() > 0:
+            print("\n過去の予測結果の検証（答え合わせ）を実行中...")
+            for idx, row in history_df[mask].iterrows():
+                ticker = row['Ticker']
+                pred_date = row['Date']
+                base_close = row['Close']
+                
+                try:
+                    df_check = yf.download(ticker, start=pred_date, progress=False)
+                    if isinstance(df_check.columns, pd.MultiIndex):
+                        df_check.columns = df_check.columns.droplevel(1)
+                    
+                    if len(df_check) > 1:
+                        next_close = float(df_check.iloc[1]['Close'])
+                        history_df.loc[idx, 'Actual_Close_Next'] = next_close
+                        
+                        is_hit = 1 if next_close > base_close else 0
+                        history_df.loc[idx, 'Is_Hit'] = is_hit
+                except Exception:
+                    pass
+                
+                # Yahoo Financeの401ブロック対策でウェイトを入れる
+                time.sleep(1.0)
+                    
+            history_df.to_csv(history_file, index=False)
+            
+        # 過去の累計的中率（勝率）を計算して表示
         hit_evaluated = history_df.dropna(subset=['Is_Hit'])
         if len(hit_evaluated) > 0:
             total_accuracy = (hit_evaluated['Is_Hit'].sum() / len(hit_evaluated)) * 100
             print(f"📊 【AI運用実績】これまでの予測総数: {len(hit_evaluated)}件 | 累計的中率: {total_accuracy:.1f}%")
 
-    updated_history = pd.concat([history_df, today_log], ignore_index=True)
-    updated_history.to_csv(history_file, index=False)
-else:
-    today_log.to_csv(history_file, index=False)
-    print(f"\n📁 新規の予測履歴ファイル '{history_file}' を作成し、本日の結果を保存しました。")
+        # 同日に複数回実行した場合の重複を防ぎ、最新の結果で上書きする
+        history_df = history_df[history_df['Date'] != today_str]
+        updated_history = pd.concat([history_df, today_log], ignore_index=True)
+        updated_history.to_csv(history_file, index=False)
+    else:
+        today_log.to_csv(history_file, index=False)
+        print(f"\n📁 新規の予測履歴ファイル '{history_file}' を作成し、本日の結果を保存しました。")
 
-print(f"本日の予測データが {history_file} に正常に蓄積されました。")
+    print(f"本日の予測データが {history_file} に正常に蓄積されました。")
