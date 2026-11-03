@@ -1,0 +1,43 @@
+name: Daily Stock Screener & AI Predictor
+
+on:
+  schedule:
+    # JSTの月〜金 17:00（UTCの 08:00）に自動実行
+    - cron: '0 8 * * 1-5'
+  
+  # GitHubの画面から手動でも実行できるようにするボタンを追加
+  workflow_dispatch: 
+
+jobs:
+  run-screener:
+    runs-on: ubuntu-latest
+
+    steps:
+    # 1. リポジトリのコードをチェックアウト
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    # 2. Python環境のセットアップ
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    # 3. 必要なライブラリのインストール
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install yfinance pandas numpy lightgbm tqdm requests openpyxl
+
+    # 4. スクリプトの実行（ファイル名を main.py と仮定しています）
+    - name: Run Python Script
+      run: python main.py
+
+    # 5. 生成された履歴やCSVファイルを自動でGitに保存（オプション）
+    - name: Commit and push updated history
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+        git add ai_prediction_history.csv ai_ranking_with_prices.csv || true
+        git commit -m "Auto-update AI prediction history [skip ci]" || true
+        git push || true
