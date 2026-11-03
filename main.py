@@ -1,4 +1,3 @@
-from google.colab import files
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -7,10 +6,11 @@ from tqdm import tqdm
 import time
 import warnings
 import os
+import random
 from datetime import datetime
 warnings.filterwarnings('ignore')
 
-# 1. ダウンロードしたJPX銘柄一覧ファイルのアップロード
+# 1. 銘柄一覧ファイルの指定
 file_name = 'data_j.xlsx'
 
 # 2. ファイルの読み込み
@@ -32,13 +32,24 @@ uptrend_data = []
 latest_features = []
 passed_tickers = []
 
-chunk_size = 50
+chunk_size = 25  # 負荷軽減のため一度の取得数を25に調整
 for i in tqdm(range(0, len(valid_tickers), chunk_size)):
     chunk = valid_tickers[i:i + chunk_size]
     
-    try:
-        bulk_data = yf.download(chunk, period="2y", interval="1d", progress=False, group_by='ticker')
+    success = False
+    for attempt in range(3):
+        try:
+            bulk_data = yf.download(chunk, period="2y", interval="1d", progress=False, group_by='ticker')
+            success = True
+            break
+        except Exception as e:
+            time.sleep(3 * (attempt + 1))
+            
+    if not success:
+        time.sleep(5)
+        continue
         
+    try:
         for ticker in chunk:
             if len(chunk) == 1:
                 df = bulk_data.copy()
@@ -74,8 +85,6 @@ for i in tqdm(range(0, len(valid_tickers), chunk_size)):
             delta = df['Close'].diff()
             gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-            
-            # RSIの計算
             df['RSI'] = 100 - (100 / (1 + gain / loss))
             
             df['Target'] = (df['Close'].shift(-1) > df['Close']).astype(int)
@@ -89,26 +98,48 @@ for i in tqdm(range(0, len(valid_tickers), chunk_size)):
             passed_tickers.append(ticker)
             
     except Exception as e:
-        time.sleep(2)
         continue
+        
+    # チャンクごとのウェイトを少し長めにとってブロックを予防
+    time.sleep(random.uniform(2.0, 4.0))
 
 print(f"\nスクリーニング通過: {len(passed_tickers)} 社")
 
 if not uptrend_data:
     print("条件を満たす銘柄がありませんでした。日経平均などの地合いを確認してください。")
 else:
-    print("\n第2段階: 通過した有望銘柄のファンダメンタル情報を取得しています...")
+    print(f"\n第2段階: 通過した有望銘柄のファンダメンタル情報を取得しています...")
     fund_data = []
+    
     for ticker in tqdm(passed_tickers):
-        try:
-            info = yf.Ticker(ticker).info
+        success = False
+        info = {}
+        
+        for attempt in range(3):
+            try:
+                stock_obj = yf.Ticker(ticker)
+                info = stock_obj.info
+                if info and ('trailingPE' in info or 'priceToBook' in info):
+                    success = True
+                    break
+            except Exception as e:
+                time.sleep(3 * (attempt + 1))
+        
+        if success and info:
             fund_data.append({
                 'Ticker': ticker,
                 'PER': info.get('trailingPE', np.nan),
                 'PBR': info.get('priceToBook', np.nan)
             })
-        except:
-            pass
+        else:
+            fund_data.append({
+                'Ticker': ticker,
+                'PER': np.nan,
+                'PBR': np.nan
+            })
+            
+        # 銘柄ごとのウェイトを1.5秒に設定し、401エラーを徹底防御
+        time.sleep(1.5)
             
     fund_df = pd.DataFrame(fund_data)
     
@@ -136,7 +167,7 @@ else:
     ranking = ranking.sort_values(by='AI_Win_Probability', ascending=False).reset_index(drop=True)
     ranking.index = ranking.index + 1
     
-    # データの算出（価格は整数に丸めてスッキリさせる）
+    # データの算出
     ranking['Target_Buy'] = ranking['Close'].round(0).astype(int)
     ranking['Take_Profit'] = (ranking['Close'] * 1.05).round(0).astype(int)
     ranking['Stop_Loss'] = (ranking['Close'] * 0.98).round(0).astype(int)
@@ -168,53 +199,45 @@ today_str = datetime.now().strftime('%Y-%m-%d')
 # 1. 本日のランキング上位15銘柄のデータを抽出してログ用データフレームを作成
 today_log = ranking.head(15).copy()
 today_log['Date'] = today_str
-today_log['Actual_Close_Next'] = np.nan # 翌日終値（後から埋まる）
-today_log['Is_Hit'] = np.nan            # 的中判定（後から埋まる）
+today_log['Actual_Close_Next'] = np.nan 
+today_log['Is_Hit'] = np.nan            
 
 # 2. 過去の履歴ファイルが存在する場合、過去データの「答え合わせ」を試みる
 if os.path.exists(history_file):
     history_df = pd.read_csv(history_file)
     
-    # まだ答え合わせができていない（ActualがNaNの）過去レコードをチェック
     mask = history_df['Actual_Close_Next'].isna()
     if mask.sum() > 0:
         print("\n過去の予測結果の検証（答え合わせ）を実行中...")
         for idx, row in history_df[mask].iterrows():
             ticker = row['Ticker']
             pred_date = row['Date']
-            base_close = row['Close'] # 予測日の終値
+            base_close = row['Close']
             
             try:
-                # 予測日の翌日以降のデータをYahoo Financeから取得して実際の株価を確認
                 df_check = yf.download(ticker, start=pred_date, progress=False)
                 if isinstance(df_check.columns, pd.MultiIndex):
                     df_check.columns = df_check.columns.droplevel(1)
                 
-                # 予測日より後のデータが存在する場合
                 if len(df_check) > 1:
-                    next_close = df_check.iloc[1]['Close'] # 翌営業日の終値
+                    next_close = df_check.iloc[1]['Close']
                     history_df.loc[idx, 'Actual_Close_Next'] = next_close
                     
-                    # 実際に株価が上がっていれば的中(1)、下がっていれば外れ(0)
                     is_hit = 1 if next_close > base_close else 0
                     history_df.loc[idx, 'Is_Hit'] = is_hit
             except:
                 pass
                 
-        # 検証結果を上書き保存
         history_df.to_csv(history_file, index=False)
         
-        # 過去の累計的中率（勝率）を計算して表示
         hit_evaluated = history_df.dropna(subset=['Is_Hit'])
         if len(hit_evaluated) > 0:
             total_accuracy = (hit_evaluated['Is_Hit'].sum() / len(hit_evaluated)) * 100
             print(f"📊 【AI運用実績】これまでの予測総数: {len(hit_evaluated)}件 | 累計的中率: {total_accuracy:.1f}%")
 
-    # 本日の新しい予測データを履歴ファイルに追記
     updated_history = pd.concat([history_df, today_log], ignore_index=True)
     updated_history.to_csv(history_file, index=False)
 else:
-    # 初回実行時はそのままファイルを作成
     today_log.to_csv(history_file, index=False)
     print(f"\n📁 新規の予測履歴ファイル '{history_file}' を作成し、本日の結果を保存しました。")
 
