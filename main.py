@@ -214,6 +214,7 @@ else:
         success = False
         info = {}
         
+        # 401エラーを防ぐためのリトライ＆ウェイト処理
         for attempt in range(3):
             try:
                 stock_obj = yf.Ticker(ticker)
@@ -221,7 +222,7 @@ else:
                 if info and ('trailingPE' in info or 'priceToBook' in info):
                     success = True
                     break
-            except Exception:
+            except Exception as e:
                 time.sleep(3 * (attempt + 1))
         
         if success and info:
@@ -231,15 +232,17 @@ else:
                 'PBR': info.get('priceToBook', np.nan)
             })
         else:
+            # 取得に失敗した場合はNaNを入れてプログラムを止めずに継続
             fund_data.append({
                 'Ticker': ticker,
                 'PER': np.nan,
                 'PBR': np.nan
             })
             
-        time.sleep(1.5)
+        # 銘柄ごとの取得合間に必ず2秒以上のウェイトを挟んでボット判定を回避
+        time.sleep(2.0)
             
-    fund_df = pd.DataFrame(fund_data)
+        fund_df = pd.DataFrame(fund_data)
     
     combined_train = pd.concat(uptrend_data).merge(fund_df, on='Ticker', how='left')
     combined_latest = pd.concat(latest_features).merge(fund_df, on='Ticker', how='left')
