@@ -45,3 +45,20 @@ jobs:
         git add ai_prediction_history.csv ai_ranking_with_prices.csv || true
         git commit -m "Auto-update AI prediction history [skip ci]" || true
         git push || true
+
+    # 6. 【追加】検証レポートとランキング結果をメールで通知
+    - name: Send Email Notification
+      if: always()
+      uses: dawidd6/action-send-mail@v3
+      with:
+        server_address: smtp.gmail.com
+        server_port: 465
+        secure: true
+        username: ${{ secrets.MAIL_ADDRESS }}
+        password: ${{ secrets.MAIL_PASSWORD }}
+        subject: "📊 【AI株価予測】本日の有望銘柄ランキング＆答え合わせレポート"
+        to: ${{ secrets.MAIL_ADDRESS }}
+        from: "AI Stock Screener <${{ secrets.MAIL_ADDRESS }}>"
+        body: file://prediction_report.md
+        convert_markdown: true
+        attachments: ai_ranking_with_prices.csv,ai_prediction_history.csv
