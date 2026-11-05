@@ -43,57 +43,44 @@ JST = timezone(timedelta(hours=9))
 today_str = datetime.now(JST).strftime('%Y-%m-%d')
 print(f"📅 本日の実行日 (JST): {today_str}")
 
-# --- J-Quants API ヘルパー関数（環境変数が設定されている場合のみ稼働） ---
-def get_jquants_id_token():
-    mail = os.environ.get('JQUANTS_MAIL')
-    password = os.environ.get('JQUANTS_PASSWORD')
-    if not mail or not password:
+# --- J-Quants API V2（APIキー方式）ヘルパー関数 ---
+def get_jquants_api_key():
+    api_key = os.environ.get('JQUANTS_API_KEY', '').strip()
+    if not api_key:
         return None
-    try:
-        r_ref = requests.post(
-            "https://api.jquants.com/v1/token/auth_user",
-            json={"mailaddress": mail, "password": password},
-            timeout=10
-        )
-        if r_ref.status_code != 200:
-            return None
-        refresh_token = r_ref.json().get("refreshToken")
-        r_id = requests.post(
-            f"https://api.jquants.com/v1/token/auth_refresh?refreshtoken={refresh_token}",
-            timeout=10
-        )
-        if r_id.status_code != 200:
-            return None
-        return r_id.json().get("idToken")
-    except Exception:
-        return None
+    return api_key
 
-def fetch_jquants_fundamentals(tickers, id_token):
-    """通過銘柄の最新財務データ（EPS・BPS）をJ-Quants公式APIから安全に取得"""
+def fetch_jquants_fundamentals(tickers, api_key):
+    """通過銘柄の最新財務データ（EPS・BPS）をJ-Quants API V2から取得"""
     fund_dict = {}
-    headers = {'Authorization': f'Bearer {id_token}'}
-    print("\n🏛️ J-Quants公式APIから通過銘柄の財務データ（EPS・BPS）を取得中...")
+    headers = {'x-api-key': api_key}
+    print("\n🏛️ J-Quants公式API (V2) から通過銘柄の財務データ（EPS・BPS）を取得中...")
     for t in tqdm(tickers):
         code4 = t.replace('.T', '')
         try:
             r = requests.get(
-                f"https://api.jquants.com/v1/fins/statements?code={code4}",
+                "https://api.jquants.com/v2/fins/summary",
+                params={"code": code4},
                 headers=headers,
                 timeout=10
             )
             if r.status_code == 200:
-                stmts = r.json().get('statements', [])
-                if stmts:
-                    latest_s = stmts[-1]
-                    # 予想EPS（なければ実績EPS）とBPSを取得
-                    eps = latest_s.get('ForecastEarningsPerShare') or latest_s.get('EarningsPerShare')
-                    bps = latest_s.get('BookValuePerShare')
+                data_list = r.json().get('data', []) or r.json().get('fins_summary', []) or r.json().get('statements', [])
+                if data_list:
+                    latest_s = data_list[-1]
+                    # V2項目の予想EPS(FEPS / NxFEPS)・実績EPS・BPSを取得
+                    eps = (
+                        latest_s.get('FEPS') or latest_s.get('NxFEPS') or 
+                        latest_s.get('EPS') or latest_s.get('ForecastEarningsPerShare') or 
+                        latest_s.get('EarningsPerShare')
+                    )
+                    bps = latest_s.get('BPS') or latest_s.get('BookValuePerShare')
                     eps_val = float(eps) if eps not in (None, "", "-") else np.nan
                     bps_val = float(bps) if bps not in (None, "", "-") else np.nan
                     fund_dict[t] = {'EPS': eps_val, 'BPS': bps_val}
         except Exception:
             pass
-        time.sleep(0.1) # 公式APIのため0.1秒間隔で高速かつ安全に取得可能
+        time.sleep(0.12)
     return fund_dict
 
 # --- 事前処理1: 過去の予測履歴の検証（答え合わせ） ---
@@ -317,10 +304,10 @@ else:
     combined_train = pd.concat(uptrend_data)
     combined_latest = pd.concat(latest_features)
     
-    # --- ⑥ J-Quants API 財務データの統合（設定されている場合のみ自動実行） ---
-    jq_token = get_jquants_id_token()
-    if jq_token:
-        jq_fund = fetch_jquants_fundamentals(passed_tickers, jq_token)
+    # --- ⑥ J-Quants API V2 財務データの統合 ---
+    jq_api_key = get_jquants_api_key()
+    if jq_api_key:
+        jq_fund = fetch_jquants_fundamentals(passed_tickers, jq_api_key)
         eps_map = {k: v['EPS'] for k, v in jq_fund.items()}
         bps_map = {k: v['BPS'] for k, v in jq_fund.items()}
         
@@ -330,9 +317,9 @@ else:
             df_part['PER'] = np.where(eps_s > 0, df_part['Close'] / eps_s, np.nan)
             df_part['PBR'] = np.where(bps_s > 0, df_part['Close'] / bps_s, np.nan)
             df_part['ROE'] = np.where(bps_s > 0, (eps_s / bps_s) * 100, np.nan)
-        print("   ➔ J-Quants財務指標（PER・PBR・ROE）の統合完了。")
+        print(f"   ➔ J-Quants財務指標の取得完了（有効取得: {len(jq_fund)} 社）。")
     else:
-        print("\n💡 J-Quants API認証情報（JQUANTS_MAIL / JQUANTS_PASSWORD）が未設定のため、マルチタイムフレーム＆マクロ指標モードで学習します。")
+        print("\n💡 JQUANTS_API_KEY が未設定のため、マルチタイムフレーム＆マクロ指標モードで学習します。")
         for df_part in [combined_train, combined_latest]:
             df_part['PER'] = 15.0
             df_part['PBR'] = 1.2

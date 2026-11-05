@@ -36,8 +36,7 @@ jobs:
     # 4. スクリプトの実行（ファイル名を main.py と仮定しています）
     - name: Run Python Script
       env:
-        JQUANTS_MAIL: ${{ secrets.JQUANTS_MAIL }}
-        JQUANTS_PASSWORD: ${{ secrets.JQUANTS_PASSWORD }}
+        JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
       run: python main.py
 
     # 5. 生成された履歴やCSVファイルを自動でGitに保存（オプション）
