@@ -7,7 +7,7 @@ import time
 import warnings
 import os
 import random
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 warnings.filterwarnings('ignore')
 
 # 1. 銘柄一覧ファイルの指定
@@ -32,16 +32,19 @@ if '33業種区分' in df_stocks.columns:
 else:
     sector_map = {t: '-' for t in valid_tickers}
 
-# AI学習用に業種を数値コード化
 unique_sectors = sorted(list(set(sector_map.values())))
 sector_code_map = {sec: i for i, sec in enumerate(unique_sectors)}
 
 print(f"抽出完了: 全上場企業 {len(valid_tickers)} 銘柄をスクリーニング対象に設定しました。")
 
-# --- 事前処理1: 過去の予測履歴の検証（AI学習にフィードバックするため最初に実行） ---
+# --- 日本時間（JST）での日付取得 ---
+JST = timezone(timedelta(hours=9))
+today_str = datetime.now(JST).strftime('%Y-%m-%d')
+print(f"📅 本日の実行日 (JST): {today_str}")
+
+# --- 事前処理1: 過去の予測履歴の検証（答え合わせ） ---
 history_file = 'ai_prediction_history.csv'
 report_file = 'prediction_report.md'
-today_str = datetime.now().strftime('%Y-%m-%d')
 newly_verified_indices = []
 history_df = pd.DataFrame()
 
@@ -49,13 +52,15 @@ if os.path.exists(history_file):
     history_df = pd.read_csv(history_file)
     if 'Return_Pct' not in history_df.columns:
         history_df['Return_Pct'] = np.nan
-    # 過去履歴に銘柄名や業種がない場合はマッピングで補完
     if 'Name' not in history_df.columns:
         history_df['Name'] = history_df['Ticker'].map(name_map).fillna('-')
     if 'Sector' not in history_df.columns:
         history_df['Sector'] = history_df['Ticker'].map(sector_map).fillna('-')
         
+    # 未検証かつ「今日より前の日付」のデータを抽出
     mask = history_df['Actual_Close_Next'].isna() & (history_df['Date'] < today_str)
+    print(f"🔍 検証対象となる過去の予測データ数: {mask.sum()} 件")
+    
     if mask.sum() > 0:
         print("\n🔍 過去の予測結果の検証（答え合わせ）を実行中...")
         for idx, row in history_df[mask].iterrows():
@@ -64,12 +69,17 @@ if os.path.exists(history_file):
             base_close = float(row['Close'])
             
             try:
+                # 予測日以降の株価データを取得
                 df_check = yf.download(ticker, start=pred_date, progress=False)
                 if isinstance(df_check.columns, pd.MultiIndex):
                     df_check.columns = df_check.columns.droplevel(1)
                 
-                if len(df_check) > 1:
-                    next_close = float(df_check.iloc[1]['Close'])
+                # 予測日より後の日付データを抽出して、最初の1行（翌営業日）を特定
+                df_check.index = pd.to_datetime(df_check.index).strftime('%Y-%m-%d')
+                df_future = df_check[df_check.index > pred_date]
+                
+                if not df_future.empty:
+                    next_close = float(df_future.iloc[0]['Close'])
                     ret_pct = ((next_close - base_close) / base_close) * 100
                     is_hit = 1 if next_close > base_close else 0
                     
@@ -77,10 +87,11 @@ if os.path.exists(history_file):
                     history_df.loc[idx, 'Return_Pct'] = round(ret_pct, 2)
                     history_df.loc[idx, 'Is_Hit'] = is_hit
                     newly_verified_indices.append(idx)
-            except Exception:
-                pass
+                    print(f"  [検証成功] {pred_date} 予測 {ticker}: 基準 {base_close}円 ➔ 翌営業日 {next_close}円 ({ret_pct:+.2f}%) -> {'⭕ 的中' if is_hit else '❌ 外れ'}")
+            except Exception as e:
+                print(f"  [検証スキップ] {ticker} ({pred_date}): {e}")
             
-            time.sleep(1.0)
+            time.sleep(0.5)
                 
         history_df.to_csv(history_file, index=False)
 
