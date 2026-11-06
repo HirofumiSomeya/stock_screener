@@ -278,25 +278,29 @@ for i in tqdm(range(0, len(valid_tickers), chunk_size)):
             df['SMA75'] = df['Close'].rolling(window=75).mean()
 
             latest = df.iloc[-1]
-            if pd.isna(latest['SMA75']) or pd.isna(latest['SMA5']):
+            if pd.isna(latest['SMA25']) or pd.isna(latest['SMA5']):
                 continue
             
-            # 出来高倍率の計算
+            # 出来高倍率と週次リターン
             vol_ma20 = df['Volume'].rolling(window=20).mean()
             df['Volume_Ratio'] = df['Volume'] / (vol_ma20 + 1e-8)
             df['Return_5d'] = df['Close'].pct_change(5)
 
-            # 🛡️ 順張り・モメンタムフィルター（落ちてくるナイフを排除）
-            # 1. 25日線・75日線の上にある
-            # 2. 短期5日線の上にある（直近下落中を排除）
-            # 3. 直近5日騰落率がプラス（反発・上昇トレンド中）
-            # 4. 出来高倍率が0.9倍以上（商い過疎株を排除）
+            latest_ret5d = latest['Return_5d'] if pd.notna(latest['Return_5d']) else 0.0
+            latest_vol_ratio = latest['Volume_Ratio'] if pd.notna(latest['Volume_Ratio']) else 1.0
+
+            # 🛡️ 調整後フィルター（中期トレンド維持 ＋ 深い暴落株のみを排除）
+            # 1. 25日線の上にある（中期上昇基調）
+            # 2. 75日線が存在する場合は75日線の上（長期トレンド崩れを排除）
+            # 3. 5日騰落率が -3.5% 以上（急落・崩壊中のナイフを排除し、浅い押し目は拾う）
+            # 4. 出来高倍率が 0.6倍 以上（極端な閑散株・過疎株を排除）
+            sma75_ok = (latest['Close'] > latest['SMA75']) if pd.notna(latest['SMA75']) else True
+            
             is_valid_trend = (
-                (latest['Close'] > latest['SMA25']) and 
-                (latest['Close'] > latest['SMA75']) and
-                (latest['Close'] > latest['SMA5']) and
-                (latest['Return_5d'] > 0.0) and
-                (latest['Volume_Ratio'] >= 0.9)
+                (latest['Close'] > latest['SMA25']) and
+                sma75_ok and
+                (latest_ret5d >= -0.035) and
+                (latest_vol_ratio >= 0.6)
             )
             if not is_valid_trend:
                 continue
