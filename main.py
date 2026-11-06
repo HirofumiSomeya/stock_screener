@@ -121,7 +121,7 @@ def fetch_jquants_fundamentals(tickers, api_key):
         time.sleep(0.12)
     return fund_dict
 
-# --- 事前処理1: 過去の予測履歴の検証（トリプルバリア答え合わせ） ---
+# --- 事前処理1: 過去の予測履歴の検証（安全なトリプルバリア答え合わせ） ---
 history_file = 'ai_prediction_history.csv'
 report_file = 'prediction_report.md'
 newly_verified_indices = []
@@ -153,16 +153,23 @@ if os.path.exists(history_file):
                     df_check.columns = df_check.columns.droplevel(1)
                 
                 df_check = df_check.dropna(subset=['Close', 'High', 'Low'])
+                if df_check.empty:
+                    continue
+
                 df_check.index = pd.to_datetime(df_check.index).strftime('%Y-%m-%d')
-                
                 df_future = df_check[df_check.index > pred_date]
                 
+                # 翌営業日の有効なデータが存在するか厳格に確認
                 if not df_future.empty:
                     next_day = df_future.iloc[0]
                     next_close = float(next_day['Close'])
                     next_high = float(next_day['High'])
                     next_low = float(next_day['Low'])
                     
+                    # 取得値が不正（NaNまたは0）な場合はスキップして誤判定を防ぐ
+                    if np.isnan(next_close) or np.isnan(next_high) or np.isnan(next_low) or next_close <= 0:
+                        continue
+
                     ret_pct = ((next_close - base_close) / base_close) * 100
                     max_up_pct = ((next_high - base_close) / base_close) * 100
                     max_down_pct = ((next_low - base_close) / base_close) * 100
@@ -182,7 +189,7 @@ if os.path.exists(history_file):
             time.sleep(0.5)
                 
         history_df.to_csv(history_file, index=False)
-        print(f"   ➔ 新たに {len(newly_verified_indices)} 件の答え合わせが完了しました。")
+        print(f"   ➔ 新たに {len(newly_verified_indices)} 件の確定した答え合わせが完了しました。")
 
 # --- 事前処理2: 市場全体（マクロ指標＋ニュース感情指標）の取得 ---
 print("\n🌐 市場全体指標（日経平均・グロース指数・S&P500・ドル円・VIX・米金利）を取得中...")
@@ -227,8 +234,8 @@ for attempt in range(3):
 
 time.sleep(2.0)
 
-# --- 第1段階: スクリーニング & 特徴量の一括生成 ---
-print(f"\n第1段階: 株価3000円未満、かつ上昇トレンドの銘柄をスクリーニング中...")
+# --- 第1段階: スクリーニング & モメンタムフィルター ---
+print(f"\n第1段階: 株価3000円未満・順張りモメンタム・出来高活況銘柄をスクリーニング中...")
 uptrend_data = []
 latest_features = []
 passed_tickers = []
@@ -271,17 +278,32 @@ for i in tqdm(range(0, len(valid_tickers), chunk_size)):
             df['SMA75'] = df['Close'].rolling(window=75).mean()
 
             latest = df.iloc[-1]
-            if pd.isna(latest['SMA75']):
+            if pd.isna(latest['SMA75']) or pd.isna(latest['SMA5']):
                 continue
             
-            is_uptrend = (latest['Close'] > latest['SMA25']) and (latest['Close'] > latest['SMA75'])
-            if not is_uptrend:
+            # 出来高倍率の計算
+            vol_ma20 = df['Volume'].rolling(window=20).mean()
+            df['Volume_Ratio'] = df['Volume'] / (vol_ma20 + 1e-8)
+            df['Return_5d'] = df['Close'].pct_change(5)
+
+            # 🛡️ 順張り・モメンタムフィルター（落ちてくるナイフを排除）
+            # 1. 25日線・75日線の上にある
+            # 2. 短期5日線の上にある（直近下落中を排除）
+            # 3. 直近5日騰落率がプラス（反発・上昇トレンド中）
+            # 4. 出来高倍率が0.9倍以上（商い過疎株を排除）
+            is_valid_trend = (
+                (latest['Close'] > latest['SMA25']) and 
+                (latest['Close'] > latest['SMA75']) and
+                (latest['Close'] > latest['SMA5']) and
+                (latest['Return_5d'] > 0.0) and
+                (latest['Volume_Ratio'] >= 0.9)
+            )
+            if not is_valid_trend:
                 continue
                 
             # 特徴量生成
             df['Return'] = df['Close'].pct_change()
             df['Return_3d'] = df['Close'].pct_change(3)
-            df['Return_5d'] = df['Close'].pct_change(5)
             df['Return_20d'] = df['Close'].pct_change(20)
             df['Return_60d'] = df['Close'].pct_change(60)
             
@@ -291,8 +313,6 @@ for i in tqdm(range(0, len(valid_tickers), chunk_size)):
             df['Vol_Regime'] = vol_5d / (vol_20d + 1e-8)
             
             df['Volume_Change'] = df['Volume'].pct_change()
-            vol_ma20 = df['Volume'].rolling(window=20).mean()
-            df['Volume_Ratio'] = df['Volume'] / (vol_ma20 + 1e-8)
             
             df['SMA5_Dev'] = (df['Close'] / df['SMA5']) - 1
             df['SMA25_Dev'] = (df['Close'] / df['SMA25']) - 1
@@ -321,7 +341,7 @@ for i in tqdm(range(0, len(valid_tickers), chunk_size)):
             loss5 = (-delta.where(delta < 0, 0)).rolling(window=5).mean()
             df['RSI_5'] = 100 - (100 / (1 + gain5 / (loss5 + 1e-8)))
             
-            # 🎯 トリプルバリア法による厳格な正解ラベル（利確+2.0%達成 かつ 損切-1.5%回避）
+            # トリプルバリア正解ラベル
             next_high = df['High'].shift(-1)
             next_low = df['Low'].shift(-1)
             curr_close = df['Close']
@@ -348,7 +368,7 @@ for i in tqdm(range(0, len(valid_tickers), chunk_size)):
 print(f"\nスクリーニング通過: {len(passed_tickers)} 社")
 
 if not uptrend_data:
-    print("条件を満たす銘柄がありませんでした。")
+    print("条件を満たす銘柄がありませんでした。市場全体の地合いを確認してください。")
 else:
     combined_train = pd.concat(uptrend_data)
     combined_latest = pd.concat(latest_features)
@@ -374,7 +394,7 @@ else:
             df_part['PBR'] = 1.2
             df_part['ROE'] = 8.0
 
-    # 業種コード付与
+    # 業種コード
     combined_train['Sector_Code'] = combined_train['Ticker'].map(sector_map).map(sector_code_map).fillna(-1)
     combined_latest['Sector_Code'] = combined_latest['Ticker'].map(sector_map).map(sector_code_map).fillna(-1)
 
@@ -385,7 +405,7 @@ else:
     latest_sec_ret = combined_latest.groupby('Sector_Code')['Return'].transform('mean')
     combined_latest['Sector_Return'] = latest_sec_ret.fillna(0)
 
-    # マクロ指標の結合
+    # マクロ指標
     macro_cols = [
         'N225_Return', 'N225_Return_5d', 'N225_Trend', 'Growth_Return', 'Growth_Trend',
         'SP500_Return', 'USDJPY_Return', 'VIX_Level', 'US10Y_Return'
@@ -438,11 +458,11 @@ else:
             for idx_w, key in enumerate(train_keys):
                 if key in verified_outcome_map:
                     if verified_outcome_map[key] == 0:
-                        sample_weights[idx_w] = 5.0
+                        sample_weights[idx_w] = 3.0  # 過剰なペナルティを3.0倍に調整
                         matched_misses += 1
                     else:
-                        sample_weights[idx_w] = 2.0
-            print(f"   ➔ 過去の失敗パターン {matched_misses} 件に重点ペナルティ重み（x5.0）を適用しました。")
+                        sample_weights[idx_w] = 1.5
+            print(f"   ➔ 過去の失敗パターン {matched_misses} 件にペナルティ重み（x3.0）を適用しました。")
 
     features = [
         'Return', 'Return_3d', 'Return_5d', 'Return_20d', 'Return_60d',
@@ -457,9 +477,11 @@ else:
     ]
     X_train, y_train = combined_train[features], combined_train['Target']
     
-    print("\n第2段階: AI学習（トリプルバリア法・マルチタイムフレーム・需給・ニュース統合）実行中...")
+    print("\n第2段階: AI学習（過学習抑制・トリプルバリア法・順張りモメンタム）実行中...")
+    # 過学習を抑制するパラメータ設定（max_depth=3, subsample=0.8, colsample_bytree=0.8）
     lgb_model = lgb.LGBMClassifier(
-        n_estimators=300, learning_rate=0.01, max_depth=5, 
+        n_estimators=250, learning_rate=0.015, max_depth=3,
+        subsample=0.8, colsample_bytree=0.8,
         random_state=42, verbose=-1
     )
     lgb_model.fit(X_train, y_train, sample_weight=sample_weights)
@@ -474,7 +496,7 @@ else:
     ranking = ranking.sort_values(by='AI_Win_Probability', ascending=False).reset_index(drop=True)
     ranking.index = ranking.index + 1
     
-    # データの算出（トリプルバリア目標値）
+    # データの算出
     ranking['Target_Buy'] = ranking['Close'].round(0).astype(int)
     ranking['Take_Profit'] = (ranking['Close'] * 1.02).round(0).astype(int)
     ranking['Stop_Loss'] = (ranking['Close'] * 0.985).round(0).astype(int)
@@ -489,7 +511,7 @@ else:
     ranking['SL_Str'] = ranking['Stop_Loss'].apply(lambda x: f"{x:,}円 (-1.5%)")
 
     print("\n" + "="*110)
-    print("🔥 【AI厳選】3,000円未満・トリプルバリア推奨トレードプラン (上位15選)")
+    print("🔥 【AI厳選】3,000円未満・順張りモメンタム＆トリプルバリア推奨トレードプラン (上位15選)")
     print("="*110)
     print(f"{'順位':<4} {'コード':<8} {'銘柄名':<16} {'業種':<12} {'現在値':<9} {'AI勝率':<7} {'5日騰落':<8} {'出来高倍':<8} {'利確目標(+2.0%)':<16} {'損切り(-1.5%)':<14}")
     print("-"*110)
@@ -515,7 +537,8 @@ else:
     today_log['Max_Down_Pct'] = np.nan
     today_log['Is_Hit'] = np.nan            
 
-    hit_evaluated = history_df.dropna(subset=['Is_Hit']).copy() if not history_df.empty else pd.DataFrame()
+    # 正しくザラ場高安データが確定したレコードのみを集計
+    hit_evaluated = history_df.dropna(subset=['Is_Hit', 'Max_Up_Pct']).copy() if not history_df.empty else pd.DataFrame()
     
     if len(hit_evaluated) > 0:
         if newly_verified_indices:
@@ -579,7 +602,7 @@ else:
             md_lines.append(f"| {r['Date']} | {r['Ticker']} | {r_name} | {r_sec} | {r['AI_Win_Probability']*100:.1f}% | {int(round(r['Close'])):,}円 | {up_s} | {down_s} | {mark} |")
         md_lines.append("\n")
     else:
-        md_lines.append("> ※まだ翌営業日のザラ場データが確定した検証済みデータがありません。翌営業日以降の実行時に答え合わせ結果とフィードバック学習が反映されます。\n")
+        md_lines.append("> ※まだ翌営業日の確定したザラ場データがありません。翌営業日以降の確定時に答え合わせ結果とフィードバック学習が反映されます。\n")
 
     md_lines.append(f"## 3. 本日 ({today_str}) のAI厳選ランキング (上位15銘柄)")
     md_lines.append("| 順位 | コード | 銘柄名 | 業種 | 現在値 | AI勝率 | 5日騰落 | 出来高倍率 | RSI | 利確目標 (+2.0%) | 損切り (-1.5%) |")
