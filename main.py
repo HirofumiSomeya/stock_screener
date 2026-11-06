@@ -8,6 +8,9 @@ import warnings
 import os
 import random
 import requests
+import urllib.request
+import urllib.parse
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 warnings.filterwarnings('ignore')
 
@@ -43,15 +46,59 @@ JST = timezone(timedelta(hours=9))
 today_str = datetime.now(JST).strftime('%Y-%m-%d')
 print(f"📅 本日の実行日 (JST): {today_str}")
 
-# --- J-Quants API V2（APIキー方式）ヘルパー関数 ---
+# --- 📰 経済・海外情勢ニュース センチメント分析ヘルパー ---
+def fetch_market_news_sentiment():
+    """
+    主要経済・世界情勢ニュースの見出しから市場センチメント（-1.0〜+1.0）を算出
+    """
+    query = "日経平均 OR 米国株 OR 世界経済 OR 為替 OR 地政学"
+    url = f"https://news.google.com/rss/search?q={urllib.parse.quote(query)}&hl=ja&gl=JP&ceid=JP:ja"
+    
+    pos_words = [
+        '上昇', '高値', '反発', '好調', '買い', '最高', '改善', '緩和', 
+        '堅調', '急伸', '強含み', '続伸', '利下げ', '黒字', '上方修正', '回復'
+    ]
+    neg_words = [
+        '下落', '急落', '安値', '反落', '警戒', '売り', '悪化', '懸念', 
+        '暴落', '緊縮', 'リスク', '戦争', '低迷', '利上げ', '赤字', '下方修正', '制裁'
+    ]
+    
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            xml_data = response.read()
+            
+        root = ET.fromstring(xml_data)
+        titles = [item.find('title').text for item in root.findall('.//item') if item.find('title') is not None]
+        titles = titles[:40] # 直近40件の見出しを解析
+        
+        pos_count = 0
+        neg_count = 0
+        for t in titles:
+            for w in pos_words:
+                if w in t: pos_count += 1
+            for w in neg_words:
+                if w in t: neg_count += 1
+                
+        total = pos_count + neg_count
+        if total == 0:
+            score = 0.0
+        else:
+            score = (pos_count - neg_count) / total
+            
+        print(f"📰 本日の経済・世界情勢ニュース感情スコア: {score:+.2f} (ポジティブ:{pos_count}件, ネガティブ:{neg_count}件)")
+        return float(round(score, 3))
+    except Exception as e:
+        print(f"⚠️ ニュース感情分析スキップ (デフォルト0.0): {e}")
+        return 0.0
+
+# --- J-Quants API V2 ヘルパー関数 ---
 def get_jquants_api_key():
     api_key = os.environ.get('JQUANTS_API_KEY', '').strip()
-    if not api_key:
-        return None
-    return api_key
+    return api_key if api_key else None
 
 def fetch_jquants_fundamentals(tickers, api_key):
-    """通過銘柄の最新財務データ（EPS・BPS）をJ-Quants API V2から取得"""
+    """通過銘柄の最新財務データをJ-Quants API V2から取得"""
     fund_dict = {}
     headers = {'x-api-key': api_key}
     print("\n🏛️ J-Quants公式API (V2) から通過銘柄の財務データ（EPS・BPS）を取得中...")
@@ -68,7 +115,6 @@ def fetch_jquants_fundamentals(tickers, api_key):
                 data_list = r.json().get('data', []) or r.json().get('fins_summary', []) or r.json().get('statements', [])
                 if data_list:
                     latest_s = data_list[-1]
-                    # V2項目の予想EPS(FEPS / NxFEPS)・実績EPS・BPSを取得
                     eps = (
                         latest_s.get('FEPS') or latest_s.get('NxFEPS') or 
                         latest_s.get('EPS') or latest_s.get('ForecastEarningsPerShare') or 
@@ -135,10 +181,13 @@ if os.path.exists(history_file):
         history_df.to_csv(history_file, index=False)
         print(f"   ➔ 新たに {len(newly_verified_indices)} 件の答え合わせが完了しました。")
 
-# --- 事前処理2: 市場全体（マクロ指標＋グロース指数＋米長期金利）の取得 ---
+# --- 事前処理2: 市場全体（マクロ指標＋ニュース感情指標）の取得 ---
 print("\n🌐 市場全体指標（日経平均・グロース指数・S&P500・ドル円・VIX・米金利）を取得中...")
 macro_tickers = ['^N225', '2516.T', '^GSPC', 'JPY=X', '^VIX', '^TNX']
 macro_df = pd.DataFrame()
+
+# ニュース感情スコアの算出
+current_news_sentiment = fetch_market_news_sentiment()
 
 for attempt in range(3):
     try:
@@ -210,11 +259,11 @@ for i in tqdm(range(0, len(valid_tickers), chunk_size)):
             df = df.dropna(subset=['Close', 'High', 'Low', 'Volume'])
             if df.empty or len(df) < 100: continue
             
-            # --- 3,000円未満 フィルター ---
+            # 3,000円未満フィルター
             if df['Close'].iloc[-1] >= 3000:
                 continue
                 
-            # --- 移動平均線（短期5日・中期25日・長期75日） ---
+            # 移動平均線（短期5日・中期25日・長期75日）
             df['SMA5'] = df['Close'].rolling(window=5).mean()
             df['SMA25'] = df['Close'].rolling(window=25).mean()
             df['SMA75'] = df['Close'].rolling(window=75).mean()
@@ -227,48 +276,40 @@ for i in tqdm(range(0, len(valid_tickers), chunk_size)):
             if not is_uptrend:
                 continue
                 
-            # --- ⑦ マルチタイムフレーム（複数時間軸）特徴量 ---
-            # 1. 時間軸別リターン（1日・3日・5日・20日・60日）
+            # マルチタイムフレーム特徴量
             df['Return'] = df['Close'].pct_change()
             df['Return_3d'] = df['Close'].pct_change(3)
             df['Return_5d'] = df['Close'].pct_change(5)
             df['Return_20d'] = df['Close'].pct_change(20)
             df['Return_60d'] = df['Close'].pct_change(60)
             
-            # 2. 短期・中期ボラティリティとボラティリティ変化率
             vol_5d = df['Return'].rolling(window=5).std()
             df['Volatility'] = df['Return'].rolling(window=10).std()
             vol_20d = df['Return'].rolling(window=20).std()
             df['Vol_Regime'] = vol_5d / (vol_20d + 1e-8)
             
-            # 3. 出来高変化と20日平均出来高倍率
             df['Volume_Change'] = df['Volume'].pct_change()
             vol_ma20 = df['Volume'].rolling(window=20).mean()
             df['Volume_Ratio'] = df['Volume'] / (vol_ma20 + 1e-8)
             
-            # 4. 移動平均乖離率（短期・中期・長期）
             df['SMA5_Dev'] = (df['Close'] / df['SMA5']) - 1
             df['SMA25_Dev'] = (df['Close'] / df['SMA25']) - 1
             df['SMA75_Dev'] = (df['Close'] / df['SMA75']) - 1
             
-            # 5. MACDヒストグラム比（トレンドの加速・減速）
             ema12 = df['Close'].ewm(span=12, adjust=False).mean()
             ema26 = df['Close'].ewm(span=26, adjust=False).mean()
             macd = ema12 - ema26
             macd_sig = macd.ewm(span=9, adjust=False).mean()
             df['MACD_Hist'] = (macd - macd_sig) / (df['Close'] + 1e-8)
             
-            # 6. 過去60日（3ヶ月）高値・安値レンジ内の位置（0.0〜1.0）
             high_60 = df['High'].rolling(window=60).max()
             low_60 = df['Low'].rolling(window=60).min()
             df['Range_60d_Pos'] = (df['Close'] - low_60) / (high_60 - low_60 + 1e-8)
             
-            # 7. ボリンジャーバンド位置
             sma20 = df['Close'].rolling(window=20).mean()
             std20 = df['Close'].rolling(window=20).std()
             df['BB_Pos'] = (df['Close'] - sma20) / (2 * std20 + 1e-8)
             
-            # 8. 短期RSI(5日) と 中期RSI(14日)
             delta = df['Close'].diff()
             gain14 = (delta.where(delta > 0, 0)).rolling(window=14).mean()
             loss14 = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
@@ -304,7 +345,7 @@ else:
     combined_train = pd.concat(uptrend_data)
     combined_latest = pd.concat(latest_features)
     
-    # --- ⑥ J-Quants API V2 財務データの統合 ---
+    # --- J-Quants API V2 財務データの統合 ---
     jq_api_key = get_jquants_api_key()
     if jq_api_key:
         jq_fund = fetch_jquants_fundamentals(passed_tickers, jq_api_key)
@@ -329,7 +370,7 @@ else:
     combined_train['Sector_Code'] = combined_train['Ticker'].map(sector_map).map(sector_code_map).fillna(-1)
     combined_latest['Sector_Code'] = combined_latest['Ticker'].map(sector_map).map(sector_code_map).fillna(-1)
 
-    # 業種別モメンタム（セクターローテーションの把握）
+    # 業種別モメンタム
     sector_daily_ret = combined_train.groupby(['Date_Str', 'Sector_Code'])['Return'].transform('mean')
     combined_train['Sector_Return'] = sector_daily_ret.fillna(0)
     
@@ -349,7 +390,11 @@ else:
             combined_train[col] = 0.0
             combined_latest[col] = 0.0
 
-    # 対市場の相対的強さ（1日＆5日）
+    # 📰 ニュース感情スコア（最新の市場センチメントを特徴量として結合）
+    combined_train['News_Sentiment'] = 0.0 # 過去の学習データ平均
+    combined_latest['News_Sentiment'] = current_news_sentiment # 最新の予測データ
+
+    # 対市場の相対的強さ
     combined_train['Relative_Return'] = combined_train['Return'] - combined_train['N225_Return'].fillna(0)
     combined_latest['Relative_Return'] = combined_latest['Return'] - combined_latest['N225_Return'].fillna(0)
     combined_train['Relative_Return_5d'] = combined_train['Return_5d'] - combined_train['N225_Return_5d'].fillna(0)
@@ -391,7 +436,7 @@ else:
                         sample_weights[idx_w] = 2.0
             print(f"   ➔ 過去の失敗パターン {matched_misses} 件に重点ペナルティ重み（x5.0）を適用しました。")
 
-    # 全32種類のマルチタイムフレーム・財務・セクター・マクロ特徴量
+    # 全33種類の特徴量（マルチタイムフレーム＋テクニカル＋財務＋マクロ＋ニュース感情）
     features = [
         'Return', 'Return_3d', 'Return_5d', 'Return_20d', 'Return_60d',
         'Volatility', 'Vol_Regime', 'Volume_Change', 'Volume_Ratio',
@@ -400,11 +445,12 @@ else:
         'Sector_Code', 'Sector_Return', 'Past_Hit_Rate',
         'N225_Return', 'N225_Return_5d', 'N225_Trend', 'Growth_Return', 'Growth_Trend',
         'Relative_Return', 'Relative_Return_5d', 'Relative_Growth',
-        'SP500_Return', 'USDJPY_Return', 'VIX_Level', 'US10Y_Return'
+        'SP500_Return', 'USDJPY_Return', 'VIX_Level', 'US10Y_Return',
+        'News_Sentiment' # 📰 経済・世界情勢感情指標
     ]
     X_train, y_train = combined_train[features], combined_train['Target']
     
-    print("\n第2段階: AI学習（マルチタイムフレーム＋需給＋マクロ＋過去検証統合）と勝率ランキング生成中...")
+    print("\n第2段階: AI学習（ニュース感情・需給・マルチタイムフレーム・マクロ地合い統合）と勝率ランキング生成中...")
     lgb_model = lgb.LGBMClassifier(
         n_estimators=300, learning_rate=0.01, max_depth=5, 
         random_state=42, verbose=-1
@@ -495,18 +541,20 @@ else:
         print("="*95)
 
     # Markdownレポートの生成
+    sentiment_desc = "強気 (リスクオン)" if current_news_sentiment > 0.1 else ("弱気 (リスクオフ・警戒)" if current_news_sentiment < -0.1 else "中立")
     md_lines = [f"# 📊 AI株価予測 検証レポート (最終更新: {today_str})\n"]
     
     if not macro_df.empty:
         latest_m = macro_df.iloc[-1]
-        md_lines.append("## 🌐 直近の市場環境（マクロ・中小型株指標）")
+        md_lines.append("## 🌐 直近の市場環境（マクロ・ニュース・中小型株指標）")
+        md_lines.append(f"- **ニュース・市場センチメント**: **{sentiment_desc}**（スコア: {current_news_sentiment:+.2f}）")
         md_lines.append(f"- **日経平均 前日比**: {latest_m['N225_Return']*100:+.2f}% （5日騰落: {latest_m['N225_Return_5d']*100:+.2f}% / 25日線乖離: {latest_m['N225_Trend']*100:+.2f}%）")
         md_lines.append(f"- **東証グロース250 前日比**: {latest_m['Growth_Return']*100:+.2f}% （25日線乖離: {latest_m['Growth_Trend']*100:+.2f}%）")
         md_lines.append(f"- **米国S&P500 前日比**: {latest_m['SP500_Return']*100:+.2f}% | **米10年債利回り変化**: {latest_m['US10Y_Return']*100:+.2f}%")
         md_lines.append(f"- **ドル円変動率**: {latest_m['USDJPY_Return']*100:+.2f}% | **VIX指数**: {latest_m['VIX_Level']:.1f}\n")
 
     if len(hit_evaluated) > 0:
-        md_lines.append("## 1. 累計パフォーマンス（マルチタイムフレーム＆フィードバック学習適用済）")
+        md_lines.append("## 1. 累計パフォーマンス（マルチタイムフレーム＆ニュース統合＆自己改善適用済）")
         md_lines.append(f"- **累計検証数**: {total_count} 銘柄（{total_hits}勝 {total_count - total_hits}敗）")
         md_lines.append(f"- **累計的中率（勝率）**: **{total_acc:.1f}%**")
         md_lines.append(f"- **1銘柄あたり平均騰落率**: **{avg_ret:+.2f}%**\n")
@@ -526,7 +574,7 @@ else:
 
     md_lines.append(f"## 3. 本日 ({today_str}) のAI厳選ランキング (上位15銘柄)")
     md_lines.append("| 順位 | コード | 銘柄名 | 業種 | 現在値 | AI勝率 | 5日騰落 | 出来高倍率 | RSI | 利確目標 (+5%) | 損切り (-2%) |")
-    md_lines.append("| :---: | :--- | :--- | :--- | ---: | :---: | ---: | :---: | :---: | ---: | ---: |")
+    md_lines.append("| :---: | :--- | :--- | :--- | ---: | :---: | :---: | :---: | :---: | ---: | ---: |")
     for idx, r in ranking.head(15).iterrows():
         md_lines.append(f"| {idx} | {r['Ticker']} | {r['Name']} | {r['Sector']} | {r['Close_Str']} | {r['AI_Win_Probability_Str']} | {r['Ret5d_Str']} | {r['Vol_Ratio_Str']} | {r['RSI_Str']} | {r['TP_Str']} | {r['SL_Str']} |")
 
