@@ -48,9 +48,6 @@ print(f"📅 本日の実行日 (JST): {today_str}")
 
 # --- 📰 経済・海外情勢ニュース センチメント分析ヘルパー ---
 def fetch_market_news_sentiment():
-    """
-    主要経済・世界情勢ニュースの見出しから市場センチメント（-1.0〜+1.0）を算出
-    """
     query = "日経平均 OR 米国株 OR 世界経済 OR 為替 OR 地政学"
     url = f"https://news.google.com/rss/search?q={urllib.parse.quote(query)}&hl=ja&gl=JP&ceid=JP:ja"
     
@@ -70,7 +67,7 @@ def fetch_market_news_sentiment():
             
         root = ET.fromstring(xml_data)
         titles = [item.find('title').text for item in root.findall('.//item') if item.find('title') is not None]
-        titles = titles[:40] # 直近40件の見出しを解析
+        titles = titles[:40]
         
         pos_count = 0
         neg_count = 0
@@ -81,11 +78,7 @@ def fetch_market_news_sentiment():
                 if w in t: neg_count += 1
                 
         total = pos_count + neg_count
-        if total == 0:
-            score = 0.0
-        else:
-            score = (pos_count - neg_count) / total
-            
+        score = (pos_count - neg_count) / total if total > 0 else 0.0
         print(f"📰 本日の経済・世界情勢ニュース感情スコア: {score:+.2f} (ポジティブ:{pos_count}件, ネガティブ:{neg_count}件)")
         return float(round(score, 3))
     except Exception as e:
@@ -98,7 +91,6 @@ def get_jquants_api_key():
     return api_key if api_key else None
 
 def fetch_jquants_fundamentals(tickers, api_key):
-    """通過銘柄の最新財務データをJ-Quants API V2から取得"""
     fund_dict = {}
     headers = {'x-api-key': api_key}
     print("\n🏛️ J-Quants公式API (V2) から通過銘柄の財務データ（EPS・BPS）を取得中...")
@@ -129,7 +121,7 @@ def fetch_jquants_fundamentals(tickers, api_key):
         time.sleep(0.12)
     return fund_dict
 
-# --- 事前処理1: 過去の予測履歴の検証（答え合わせ） ---
+# --- 事前処理1: 過去の予測履歴の検証（トリプルバリア答え合わせ） ---
 history_file = 'ai_prediction_history.csv'
 report_file = 'prediction_report.md'
 newly_verified_indices = []
@@ -137,8 +129,9 @@ history_df = pd.DataFrame()
 
 if os.path.exists(history_file):
     history_df = pd.read_csv(history_file)
-    if 'Return_Pct' not in history_df.columns:
-        history_df['Return_Pct'] = np.nan
+    for col in ['Return_Pct', 'Max_Up_Pct', 'Max_Down_Pct']:
+        if col not in history_df.columns:
+            history_df[col] = np.nan
     if 'Name' not in history_df.columns:
         history_df['Name'] = history_df['Ticker'].map(name_map).fillna('-')
     if 'Sector' not in history_df.columns:
@@ -148,7 +141,7 @@ if os.path.exists(history_file):
     print(f"🔍 検証対象となる過去の予測データ数: {mask.sum()} 件")
     
     if mask.sum() > 0:
-        print("\n🔍 過去の予測結果の検証（答え合わせ）を実行中...")
+        print("\n🔍 過去の予測結果の検証（トリプルバリア法：利確+2.0%/損切-1.5%）を実行中...")
         for idx, row in history_df[mask].iterrows():
             ticker = row['Ticker']
             pred_date = str(row['Date']).strip()
@@ -159,18 +152,28 @@ if os.path.exists(history_file):
                 if isinstance(df_check.columns, pd.MultiIndex):
                     df_check.columns = df_check.columns.droplevel(1)
                 
-                df_check = df_check.dropna(subset=['Close'])
+                df_check = df_check.dropna(subset=['Close', 'High', 'Low'])
                 df_check.index = pd.to_datetime(df_check.index).strftime('%Y-%m-%d')
                 
                 df_future = df_check[df_check.index > pred_date]
                 
                 if not df_future.empty:
-                    next_close = float(df_future.iloc[0]['Close'])
+                    next_day = df_future.iloc[0]
+                    next_close = float(next_day['Close'])
+                    next_high = float(next_day['High'])
+                    next_low = float(next_day['Low'])
+                    
                     ret_pct = ((next_close - base_close) / base_close) * 100
-                    is_hit = 1 if next_close > base_close else 0
+                    max_up_pct = ((next_high - base_close) / base_close) * 100
+                    max_down_pct = ((next_low - base_close) / base_close) * 100
+                    
+                    # トリプルバリア判定
+                    is_hit = 1 if (next_high >= base_close * 1.02 and next_low > base_close * 0.985) else 0
                     
                     history_df.loc[idx, 'Actual_Close_Next'] = round(next_close, 1)
                     history_df.loc[idx, 'Return_Pct'] = round(ret_pct, 2)
+                    history_df.loc[idx, 'Max_Up_Pct'] = round(max_up_pct, 2)
+                    history_df.loc[idx, 'Max_Down_Pct'] = round(max_down_pct, 2)
                     history_df.loc[idx, 'Is_Hit'] = is_hit
                     newly_verified_indices.append(idx)
             except Exception:
@@ -186,7 +189,6 @@ print("\n🌐 市場全体指標（日経平均・グロース指数・S&P500・
 macro_tickers = ['^N225', '2516.T', '^GSPC', 'JPY=X', '^VIX', '^TNX']
 macro_df = pd.DataFrame()
 
-# ニュース感情スコアの算出
 current_news_sentiment = fetch_market_news_sentiment()
 
 for attempt in range(3):
@@ -225,7 +227,7 @@ for attempt in range(3):
 
 time.sleep(2.0)
 
-# --- 第1段階: スクリーニング & マルチタイムフレーム特徴量の一括生成 ---
+# --- 第1段階: スクリーニング & 特徴量の一括生成 ---
 print(f"\n第1段階: 株価3000円未満、かつ上昇トレンドの銘柄をスクリーニング中...")
 uptrend_data = []
 latest_features = []
@@ -276,7 +278,7 @@ for i in tqdm(range(0, len(valid_tickers), chunk_size)):
             if not is_uptrend:
                 continue
                 
-            # マルチタイムフレーム特徴量
+            # 特徴量生成
             df['Return'] = df['Close'].pct_change()
             df['Return_3d'] = df['Close'].pct_change(3)
             df['Return_5d'] = df['Close'].pct_change(5)
@@ -319,8 +321,14 @@ for i in tqdm(range(0, len(valid_tickers), chunk_size)):
             loss5 = (-delta.where(delta < 0, 0)).rolling(window=5).mean()
             df['RSI_5'] = 100 - (100 / (1 + gain5 / (loss5 + 1e-8)))
             
-            # 正解ラベル（翌営業日に上がったか）
-            df['Target'] = (df['Close'].shift(-1) > df['Close']).astype(int)
+            # 🎯 トリプルバリア法による厳格な正解ラベル（利確+2.0%達成 かつ 損切-1.5%回避）
+            next_high = df['High'].shift(-1)
+            next_low = df['Low'].shift(-1)
+            curr_close = df['Close']
+            
+            hit_tp = (next_high >= curr_close * 1.02)
+            avoid_sl = (next_low > curr_close * 0.985)
+            df['Target'] = (hit_tp & avoid_sl).astype(int)
             
             df = df.replace([np.inf, -np.inf], np.nan).dropna().copy()
             if df.empty: continue
@@ -340,7 +348,7 @@ for i in tqdm(range(0, len(valid_tickers), chunk_size)):
 print(f"\nスクリーニング通過: {len(passed_tickers)} 社")
 
 if not uptrend_data:
-    print("条件を満たす銘柄がありませんでした。日経平均などの地合いを確認してください。")
+    print("条件を満たす銘柄がありませんでした。")
 else:
     combined_train = pd.concat(uptrend_data)
     combined_latest = pd.concat(latest_features)
@@ -366,7 +374,7 @@ else:
             df_part['PBR'] = 1.2
             df_part['ROE'] = 8.0
 
-    # 業種コードの付与
+    # 業種コード付与
     combined_train['Sector_Code'] = combined_train['Ticker'].map(sector_map).map(sector_code_map).fillna(-1)
     combined_latest['Sector_Code'] = combined_latest['Ticker'].map(sector_map).map(sector_code_map).fillna(-1)
 
@@ -390,11 +398,11 @@ else:
             combined_train[col] = 0.0
             combined_latest[col] = 0.0
 
-    # 📰 ニュース感情スコア（最新の市場センチメントを特徴量として結合）
-    combined_train['News_Sentiment'] = 0.0 # 過去の学習データ平均
-    combined_latest['News_Sentiment'] = current_news_sentiment # 最新の予測データ
+    # ニュース感情指標
+    combined_train['News_Sentiment'] = 0.0
+    combined_latest['News_Sentiment'] = current_news_sentiment
 
-    # 対市場の相対的強さ
+    # 相対リターン
     combined_train['Relative_Return'] = combined_train['Return'] - combined_train['N225_Return'].fillna(0)
     combined_latest['Relative_Return'] = combined_latest['Return'] - combined_latest['N225_Return'].fillna(0)
     combined_train['Relative_Return_5d'] = combined_train['Return_5d'] - combined_train['N225_Return_5d'].fillna(0)
@@ -406,7 +414,7 @@ else:
     combined_train = combined_train.replace([np.inf, -np.inf], np.nan).fillna(train_means).fillna(0)
     combined_latest = combined_latest.replace([np.inf, -np.inf], np.nan).fillna(train_means).fillna(0)
 
-    # --- フィードバック学習（過去の予測・検証結果をAIに反映） ---
+    # フィードバック学習
     sample_weights = np.ones(len(combined_train))
     combined_train['Past_Hit_Rate'] = 0.5
     combined_latest['Past_Hit_Rate'] = 0.5
@@ -436,7 +444,6 @@ else:
                         sample_weights[idx_w] = 2.0
             print(f"   ➔ 過去の失敗パターン {matched_misses} 件に重点ペナルティ重み（x5.0）を適用しました。")
 
-    # 全33種類の特徴量（マルチタイムフレーム＋テクニカル＋財務＋マクロ＋ニュース感情）
     features = [
         'Return', 'Return_3d', 'Return_5d', 'Return_20d', 'Return_60d',
         'Volatility', 'Vol_Regime', 'Volume_Change', 'Volume_Ratio',
@@ -446,11 +453,11 @@ else:
         'N225_Return', 'N225_Return_5d', 'N225_Trend', 'Growth_Return', 'Growth_Trend',
         'Relative_Return', 'Relative_Return_5d', 'Relative_Growth',
         'SP500_Return', 'USDJPY_Return', 'VIX_Level', 'US10Y_Return',
-        'News_Sentiment' # 📰 経済・世界情勢感情指標
+        'News_Sentiment'
     ]
     X_train, y_train = combined_train[features], combined_train['Target']
     
-    print("\n第2段階: AI学習（ニュース感情・需給・マルチタイムフレーム・マクロ地合い統合）と勝率ランキング生成中...")
+    print("\n第2段階: AI学習（トリプルバリア法・マルチタイムフレーム・需給・ニュース統合）実行中...")
     lgb_model = lgb.LGBMClassifier(
         n_estimators=300, learning_rate=0.01, max_depth=5, 
         random_state=42, verbose=-1
@@ -467,10 +474,10 @@ else:
     ranking = ranking.sort_values(by='AI_Win_Probability', ascending=False).reset_index(drop=True)
     ranking.index = ranking.index + 1
     
-    # データの算出
+    # データの算出（トリプルバリア目標値）
     ranking['Target_Buy'] = ranking['Close'].round(0).astype(int)
-    ranking['Take_Profit'] = (ranking['Close'] * 1.05).round(0).astype(int)
-    ranking['Stop_Loss'] = (ranking['Close'] * 0.98).round(0).astype(int)
+    ranking['Take_Profit'] = (ranking['Close'] * 1.02).round(0).astype(int)
+    ranking['Stop_Loss'] = (ranking['Close'] * 0.985).round(0).astype(int)
     
     # 表示用の文字列加工
     ranking['AI_Win_Probability_Str'] = (ranking['AI_Win_Probability'] * 100).round(1).astype(str) + '%'
@@ -478,32 +485,34 @@ else:
     ranking['Vol_Ratio_Str'] = ranking['Volume_Ratio'].round(1).astype(str) + '倍'
     ranking['Ret5d_Str'] = (ranking['Return_5d'] * 100).round(1).apply(lambda x: f"{x:+.1f}%")
     ranking['RSI_Str'] = ranking['RSI'].round(0).astype(int).astype(str)
-    ranking['TP_Str'] = ranking['Take_Profit'].apply(lambda x: f"{x:,}円 (+5%)")
-    ranking['SL_Str'] = ranking['Stop_Loss'].apply(lambda x: f"{x:,}円 (-2%)")
+    ranking['TP_Str'] = ranking['Take_Profit'].apply(lambda x: f"{x:,}円 (+2.0%)")
+    ranking['SL_Str'] = ranking['Stop_Loss'].apply(lambda x: f"{x:,}円 (-1.5%)")
 
     print("\n" + "="*110)
-    print("🔥 【AI厳選】3,000円未満・上昇有望銘柄トレードプラン (上位15選)")
+    print("🔥 【AI厳選】3,000円未満・トリプルバリア推奨トレードプラン (上位15選)")
     print("="*110)
-    print(f"{'順位':<4} {'コード':<8} {'銘柄名':<16} {'業種':<12} {'現在値':<9} {'AI勝率':<7} {'5日騰落':<8} {'出来高倍':<8} {'利確目標(+5%)':<14} {'損切り(-2%)':<12}")
+    print(f"{'順位':<4} {'コード':<8} {'銘柄名':<16} {'業種':<12} {'現在値':<9} {'AI勝率':<7} {'5日騰落':<8} {'出来高倍':<8} {'利確目標(+2.0%)':<16} {'損切り(-1.5%)':<14}")
     print("-"*110)
 
     for idx, row in ranking.head(15).iterrows():
         name_short = row['Name'][:10]
         sec_short = row['Sector'][:8]
         print(f"{idx:<4} {row['Ticker']:<8} {name_short:<16} {sec_short:<12} {row['Close_Str']:<9} {row['AI_Win_Probability_Str']:<7} "
-              f"{row['Ret5d_Str']:<8} {row['Vol_Ratio_Str']:<8} {row['TP_Str']:<14} {row['SL_Str']:<12}")
+              f"{row['Ret5d_Str']:<8} {row['Vol_Ratio_Str']:<8} {row['TP_Str']:<16} {row['SL_Str']:<14}")
     print("="*110)
 
-    # 0. 最新ランキングのCSV保存
+    # 最新ランキングの保存
     save_cols = ['Ticker', 'Name', 'Sector', 'Close', 'AI_Win_Probability', 'Target_Buy', 'Take_Profit', 'Stop_Loss']
     ranking[save_cols].to_csv('ai_ranking_with_prices.csv', index=False)
     print("\n📁 最新ランキングを 'ai_ranking_with_prices.csv' に保存しました。")
 
-    # --- 検証レポートの出力と本日の履歴保存 ---
+    # 本日の履歴準備
     today_log = ranking[save_cols].head(15).copy()
     today_log['Date'] = today_str
     today_log['Actual_Close_Next'] = np.nan 
     today_log['Return_Pct'] = np.nan
+    today_log['Max_Up_Pct'] = np.nan
+    today_log['Max_Down_Pct'] = np.nan
     today_log['Is_Hit'] = np.nan            
 
     hit_evaluated = history_df.dropna(subset=['Is_Hit']).copy() if not history_df.empty else pd.DataFrame()
@@ -511,34 +520,33 @@ else:
     if len(hit_evaluated) > 0:
         if newly_verified_indices:
             target_ver_df = history_df.loc[newly_verified_indices]
-            ver_title = "今回確定した予測の答え合わせ"
+            ver_title = "今回確定した予測の答え合わせ (トリプルバリア判定)"
         else:
             latest_ver_date = hit_evaluated['Date'].max()
             target_ver_df = hit_evaluated[hit_evaluated['Date'] == latest_ver_date]
-            ver_title = f"直近検証日 ({latest_ver_date}) の答え合わせ"
+            ver_title = f"直近検証日 ({latest_ver_date}) の答え合わせ (トリプルバリア判定)"
 
-        print("\n" + "="*95)
+        print("\n" + "="*105)
         print(f"🎯 【{ver_title}】個別銘柄の勝敗結果")
-        print("="*95)
-        print(f"{'予測日':<11} {'コード':<8} {'銘柄名':<16} {'AI勝率':<7} {'予測時終値':<10} {'翌日終値':<10} {'騰落率':<8} {'判定'}")
-        print("-"*95)
+        print("="*105)
+        print(f"{'予測日':<11} {'コード':<8} {'銘柄名':<16} {'AI勝率':<7} {'基準終値':<9} {'最高到達':<9} {'最安到達':<9} {'判定'}")
+        print("-"*105)
         for _, r in target_ver_df.iterrows():
             prob_s = f"{r['AI_Win_Probability']*100:.1f}%"
             base_s = f"{int(round(r['Close'])):,}円"
-            next_s = f"{int(round(r['Actual_Close_Next'])):,}円"
-            ret_val = r['Return_Pct'] if pd.notna(r['Return_Pct']) else ((r['Actual_Close_Next'] - r['Close']) / r['Close'] * 100)
-            ret_s = f"{ret_val:+.2f}%"
-            mark = "⭕ 的中" if r['Is_Hit'] == 1 else "❌ 外れ"
+            up_s = f"{r.get('Max_Up_Pct', 0):+.2f}%" if pd.notna(r.get('Max_Up_Pct')) else "-"
+            down_s = f"{r.get('Max_Down_Pct', 0):+.2f}%" if pd.notna(r.get('Max_Down_Pct')) else "-"
+            mark = "⭕ 利確達成" if r['Is_Hit'] == 1 else "❌ 未達/損切"
             r_name = str(r.get('Name', name_map.get(r['Ticker'], '-')))[:10]
-            print(f"{r['Date']:<11} {r['Ticker']:<8} {r_name:<16} {prob_s:<7} {base_s:<10} {next_s:<10} {ret_s:<8} {mark}")
-        print("-"*95)
+            print(f"{r['Date']:<11} {r['Ticker']:<8} {r_name:<16} {prob_s:<7} {base_s:<9} {up_s:<9} {down_s:<9} {mark}")
+        print("-"*105)
 
         total_hits = int(hit_evaluated['Is_Hit'].sum())
         total_count = len(hit_evaluated)
         total_acc = (total_hits / total_count) * 100
-        avg_ret = ((hit_evaluated['Actual_Close_Next'] - hit_evaluated['Close']) / hit_evaluated['Close'] * 100).mean()
-        print(f"📊 【累計AI運用実績】 通算: {total_hits}勝 {total_count - total_hits}敗 (計{total_count}件) | 累計的中率: {total_acc:.1f}% | 平均騰落率: {avg_ret:+.2f}%")
-        print("="*95)
+        avg_ret = hit_evaluated['Return_Pct'].mean()
+        print(f"📊 【累計AI運用実績】 通算: {total_hits}勝 {total_count - total_hits}敗 (計{total_count}件) | トリプルバリア達成率: {total_acc:.1f}% | 翌日終値平均騰落率: {avg_ret:+.2f}%")
+        print("="*105)
 
     # Markdownレポートの生成
     sentiment_desc = "強気 (リスクオン)" if current_news_sentiment > 0.1 else ("弱気 (リスクオフ・警戒)" if current_news_sentiment < -0.1 else "中立")
@@ -554,26 +562,27 @@ else:
         md_lines.append(f"- **ドル円変動率**: {latest_m['USDJPY_Return']*100:+.2f}% | **VIX指数**: {latest_m['VIX_Level']:.1f}\n")
 
     if len(hit_evaluated) > 0:
-        md_lines.append("## 1. 累計パフォーマンス（マルチタイムフレーム＆ニュース統合＆自己改善適用済）")
+        md_lines.append("## 1. 累計パフォーマンス（トリプルバリア法：利確+2.0%/損切-1.5%）")
         md_lines.append(f"- **累計検証数**: {total_count} 銘柄（{total_hits}勝 {total_count - total_hits}敗）")
-        md_lines.append(f"- **累計的中率（勝率）**: **{total_acc:.1f}%**")
-        md_lines.append(f"- **1銘柄あたり平均騰落率**: **{avg_ret:+.2f}%**\n")
+        md_lines.append(f"- **トリプルバリア達成率**: **{total_acc:.1f}%**")
+        md_lines.append(f"- **翌日終値平均騰落率**: **{avg_ret:+.2f}%**\n")
         
         md_lines.append(f"## 2. {ver_title}")
-        md_lines.append("| 予測日 | コード | 銘柄名 | 業種 | AI勝率 | 予測時終値 | 翌営業日終値 | 騰落率 | 判定 |")
+        md_lines.append("| 予測日 | コード | 銘柄名 | 業種 | AI勝率 | 基準終値 | ザラ場最高 | ザラ場最安 | 判定 |")
         md_lines.append("| :--- | :--- | :--- | :--- | :---: | ---: | ---: | ---: | :---: |")
         for _, r in target_ver_df.iterrows():
-            ret_val = r['Return_Pct'] if pd.notna(r['Return_Pct']) else ((r['Actual_Close_Next'] - r['Close']) / r['Close'] * 100)
-            mark = "⭕ 的中" if r['Is_Hit'] == 1 else "❌ 外れ"
+            mark = "⭕ 利確達成" if r['Is_Hit'] == 1 else "❌ 未達/損切"
             r_name = r.get('Name', name_map.get(r['Ticker'], '-'))
             r_sec = r.get('Sector', sector_map.get(r['Ticker'], '-'))
-            md_lines.append(f"| {r['Date']} | {r['Ticker']} | {r_name} | {r_sec} | {r['AI_Win_Probability']*100:.1f}% | {int(round(r['Close'])):,}円 | {int(round(r['Actual_Close_Next'])):,}円 | {ret_val:+.2f}% | {mark} |")
+            up_s = f"{r.get('Max_Up_Pct', 0):+.2f}%" if pd.notna(r.get('Max_Up_Pct')) else "-"
+            down_s = f"{r.get('Max_Down_Pct', 0):+.2f}%" if pd.notna(r.get('Max_Down_Pct')) else "-"
+            md_lines.append(f"| {r['Date']} | {r['Ticker']} | {r_name} | {r_sec} | {r['AI_Win_Probability']*100:.1f}% | {int(round(r['Close'])):,}円 | {up_s} | {down_s} | {mark} |")
         md_lines.append("\n")
     else:
-        md_lines.append("> ※まだ翌営業日の終値が確定した検証済みデータがありません。翌営業日以降の実行時に答え合わせ結果とフィードバック学習が反映されます。\n")
+        md_lines.append("> ※まだ翌営業日のザラ場データが確定した検証済みデータがありません。翌営業日以降の実行時に答え合わせ結果とフィードバック学習が反映されます。\n")
 
     md_lines.append(f"## 3. 本日 ({today_str}) のAI厳選ランキング (上位15銘柄)")
-    md_lines.append("| 順位 | コード | 銘柄名 | 業種 | 現在値 | AI勝率 | 5日騰落 | 出来高倍率 | RSI | 利確目標 (+5%) | 損切り (-2%) |")
+    md_lines.append("| 順位 | コード | 銘柄名 | 業種 | 現在値 | AI勝率 | 5日騰落 | 出来高倍率 | RSI | 利確目標 (+2.0%) | 損切り (-1.5%) |")
     md_lines.append("| :---: | :--- | :--- | :--- | ---: | :---: | :---: | :---: | :---: | ---: | ---: |")
     for idx, r in ranking.head(15).iterrows():
         md_lines.append(f"| {idx} | {r['Ticker']} | {r['Name']} | {r['Sector']} | {r['Close_Str']} | {r['AI_Win_Probability_Str']} | {r['Ret5d_Str']} | {r['Vol_Ratio_Str']} | {r['RSI_Str']} | {r['TP_Str']} | {r['SL_Str']} |")

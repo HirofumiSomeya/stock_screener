@@ -1,10 +1,6 @@
 name: Daily Stock Screener & AI Predictor
 
 on:
-  schedule:
-    # JSTの月〜金 17:00（UTCの 08:00）に自動実行
-    - cron: '7 8 * * 1-5'
-  
   # GitHubの画面から手動でも実行できるようにするボタンを追加
   workflow_dispatch: 
 
