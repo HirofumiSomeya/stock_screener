@@ -41,14 +41,28 @@ sector_code_map = {sec: i for i, sec in enumerate(unique_sectors)}
 
 print(f"抽出完了: 全上場企業 {len(valid_tickers)} 銘柄をスクリーニング対象に設定しました。")
 
-# --- 日本時間（JST）での日付取得 ---
+# --- 日本時間（JST）での日付・時刻取得 ---
 JST = timezone(timedelta(hours=9))
 now_jst = datetime.now(JST)
 today_str = now_jst.strftime('%Y-%m-%d')
-print(f"📅 本日の実行日 (JST): {today_str} ({now_jst.strftime('%A')})")
+print(f"📅 本日の実行日 (JST): {today_str} ({now_jst.strftime('%A')} {now_jst.strftime('%H:%M')})")
 
 # =====================================================================
-# 🛡️ 改善点1: 東証営業日・祝日判定（土日および市場休業日スキップ）
+# 🛡️ 安全ガード1: 16:00前の実行時は「Dry-run（テスト実行モード）」に設定
+# =====================================================================
+is_dry_run = now_jst.hour < 16
+if is_dry_run:
+    print("\n" + "!"*80)
+    print("⚠️ 【Dry-run（テスト実行モード）起動】")
+    print(f"   現在の実行時刻は {now_jst.strftime('%H:%M')} です（16:00前のザラ場中・途中経過）。")
+    print("   データの未確定による誤判定や本番履歴の汚染を防ぐため、")
+    print("   『ai_prediction_history.csv』への本番上書き保存は行われません。")
+    print("!"*80 + "\n")
+else:
+    print("✅ 16:00以降の実行を確認しました（本番更新モードで動作します）。\n")
+
+# =====================================================================
+# 🛡️ 安全ガード2: 東証営業日・祝日判定（土日および市場休業日スキップ）
 # =====================================================================
 # 土日判定
 if now_jst.weekday() >= 5:
@@ -63,7 +77,6 @@ try:
     check_n225.index = pd.to_datetime(check_n225.index).tz_localize(None).strftime('%Y-%m-%d')
     latest_market_date = check_n225.index[-1]
     
-    # 夕方17時以降の実行で、日経平均の最新日付が今日でない場合は祝日・休場日
     if now_jst.hour >= 16 and latest_market_date != today_str:
         print(f"🛑 本日 ({today_str}) は東証の休場日・祝日です（直近取引日: {latest_market_date}）。")
         print(f"   ➔ 不正な重複予測の生成を防ぐため、本日のスクリーニング処理を安全に終了します。")
@@ -146,45 +159,34 @@ def fetch_jquants_fundamentals(tickers, api_key):
         time.sleep(0.12)
     return fund_dict
 
-# =====================================================================
-# 🛡️ 改善点2: 先着順序・始値・終値の位置関係を反映した精密トリプルバリア関数
-# =====================================================================
+# --- 🎯 精密トリプルバリア判定関数 ---
 def evaluate_triple_barrier(base_close, next_open, next_high, next_low, next_close):
-    """
-    翌日ザラ場の値動きから、利確(+2.0%)と損切り(-1.5%)の先着順序を推定して正確に判定する
-    """
     tp_price = base_close * 1.02   # 利確ライン (+2.0%)
     sl_price = base_close * 0.985  # 損切りライン (-1.5%)
     
-    # 1. 寄り付き（始値）でのギャップアップ/ギャップダウン即時判定
     if next_open >= tp_price:
-        return 1  # 寄り付きで即利確達成
+        return 1
     if next_open <= sl_price:
-        return 0  # 寄り付きで即ロスカット発生
+        return 0
 
     reached_tp = (next_high >= tp_price)
     reached_sl = (next_low <= sl_price)
 
-    # 2. 明確な単独到達判定
     if reached_tp and not reached_sl:
-        return 1  # 利確にのみ到達（完全な勝ち）
+        return 1
     if reached_sl and not reached_tp:
-        return 0  # 損切りにのみ到達（完全な負け）
+        return 0
     if not reached_tp and not reached_sl:
-        return 0  # どちらにも届かず（未達・負け）
+        return 0
 
-    # 3. 両方のバリアに引っかかった場合（高値+2.0%超 かつ 安値-1.5%割れ）
-    # 終値の勢い（陽線引けか陰線引けか）と始値からの距離で先着を判定
     if next_close >= base_close:
-        # 上昇優勢で引けている場合、先に利確を達成した可能性が極めて高い
         return 1
     else:
-        # 崩れて陰線で引けている場合、先に急落・損切りにかかった可能性が高い
         return 0
 
 # --- 事前処理1: 過去の予測履歴の検証 ---
 history_file = 'ai_prediction_history.csv'
-report_file = 'prediction_report.md'
+report_file = 'prediction_report_dry_run.md' if is_dry_run else 'prediction_report.md'
 newly_verified_indices = []
 history_df = pd.DataFrame()
 
@@ -239,7 +241,6 @@ if os.path.exists(history_file):
                     max_up_pct = ((next_high - base_close) / base_close) * 100
                     max_down_pct = ((next_low - base_close) / base_close) * 100
                     
-                    # 🎯 精密トリプルバリア判定
                     is_hit = evaluate_triple_barrier(base_close, next_open, next_high, next_low, next_close)
                     
                     history_df.loc[idx, 'Actual_Close_Next'] = round(next_close, 1)
@@ -253,8 +254,11 @@ if os.path.exists(history_file):
             
             time.sleep(0.3)
                 
-        history_df.to_csv(history_file, index=False)
-        print(f"   ➔ 新たに {len(newly_verified_indices)} 件の確定した答え合わせが完了しました。")
+        if not is_dry_run:
+            history_df.to_csv(history_file, index=False)
+            print(f"   ➔ 新たに {len(newly_verified_indices)} 件の確定した答え合わせを履歴CSVへ保存しました。")
+        else:
+            print(f"   ➔ [Dry-run] 試算として {len(newly_verified_indices)} 件の答え合わせを確認しました（CSVへの書き込みはスキップ）。")
 
 # --- 事前処理2: 市場全体（マクロ指標＋ニュース感情指標）の取得 ---
 print("\n🌐 市場全体指標（日経平均・グロース指数・S&P500・ドル円・VIX・米金利）を取得中...")
@@ -333,11 +337,9 @@ for i in tqdm(range(0, len(valid_tickers), chunk_size)):
             df = df.dropna(subset=['Open', 'Close', 'High', 'Low', 'Volume'])
             if df.empty or len(df) < 100: continue
             
-            # 3,000円未満フィルター
             if df['Close'].iloc[-1] >= 3000:
                 continue
                 
-            # 移動平均線
             df['SMA5'] = df['Close'].rolling(window=5).mean()
             df['SMA25'] = df['Close'].rolling(window=25).mean()
             df['SMA75'] = df['Close'].rolling(window=75).mean()
@@ -346,7 +348,6 @@ for i in tqdm(range(0, len(valid_tickers), chunk_size)):
             if pd.isna(latest['SMA25']):
                 continue
             
-            # 出来高倍率と直近騰落率
             vol_ma20 = df['Volume'].rolling(window=20).mean()
             df['Volume_Ratio'] = df['Volume'] / (vol_ma20 + 1e-8)
             df['Return_5d'] = df['Close'].pct_change(5)
@@ -354,19 +355,17 @@ for i in tqdm(range(0, len(valid_tickers), chunk_size)):
             latest_ret5d = latest['Return_5d'] if pd.notna(latest['Return_5d']) else 0.0
             latest_vol_ratio = latest['Volume_Ratio'] if pd.notna(latest['Volume_Ratio']) else 1.0
 
-            # 🛡️ 緩和版スクリーニング条件
             sma75_ok = (latest['Close'] > latest['SMA75']) if pd.notna(latest['SMA75']) else True
             
             is_valid_trend = (
                 (latest['Close'] > latest['SMA25']) and
                 sma75_ok and
-                (latest_ret5d >= -0.05) and        # -5%以内の健全な押し目を許容
-                (latest_vol_ratio >= 0.6)          # 過疎株のみを排除（0.6倍以上）
+                (latest_ret5d >= -0.05) and
+                (latest_vol_ratio >= 0.6)
             )
             if not is_valid_trend:
                 continue
                 
-            # 特徴量生成
             df['Return'] = df['Close'].pct_change()
             df['Return_3d'] = df['Close'].pct_change(3)
             df['Return_20d'] = df['Close'].pct_change(20)
@@ -406,7 +405,6 @@ for i in tqdm(range(0, len(valid_tickers), chunk_size)):
             loss5 = (-delta.where(delta < 0, 0)).rolling(window=5).mean()
             df['RSI_5'] = 100 - (100 / (1 + gain5 / (loss5 + 1e-8)))
             
-            # 🎯 学習用の正解ラベル（精密トリプルバリア法）
             next_open = df['Open'].shift(-1)
             next_high = df['High'].shift(-1)
             next_low = df['Low'].shift(-1)
@@ -416,13 +414,9 @@ for i in tqdm(range(0, len(valid_tickers), chunk_size)):
             tp_price = curr_close * 1.02
             sl_price = curr_close * 0.985
             
-            # 条件分岐ラベル化
             target_series = pd.Series(0, index=df.index)
-            # 1. 寄り付き上抜け
             target_series[next_open >= tp_price] = 1
-            # 2. 単独利確
             target_series[(next_high >= tp_price) & (next_low > sl_price)] = 1
-            # 3. 両方到達時は陽線引け（終値 >= 当日終値）なら利確先行とみなす
             target_series[(next_high >= tp_price) & (next_low <= sl_price) & (next_close >= curr_close)] = 1
             
             df['Target'] = target_series
@@ -457,7 +451,6 @@ else:
     combined_train = pd.concat(uptrend_data)
     combined_latest = pd.concat(latest_features)
     
-    # --- J-Quants API V2 財務データの統合 ---
     jq_api_key = get_jquants_api_key()
     if jq_api_key:
         jq_fund = fetch_jquants_fundamentals(passed_tickers, jq_api_key)
@@ -478,18 +471,15 @@ else:
             df_part['PBR'] = 1.2
             df_part['ROE'] = 8.0
 
-    # 業種コード
     combined_train['Sector_Code'] = combined_train['Ticker'].map(sector_map).map(sector_code_map).fillna(-1)
     combined_latest['Sector_Code'] = combined_latest['Ticker'].map(sector_map).map(sector_code_map).fillna(-1)
 
-    # 業種別モメンタム
     sector_daily_ret = combined_train.groupby(['Date_Str', 'Sector_Code'])['Return'].transform('mean')
     combined_train['Sector_Return'] = sector_daily_ret.fillna(0)
     
     latest_sec_ret = combined_latest.groupby('Sector_Code')['Return'].transform('mean')
     combined_latest['Sector_Return'] = latest_sec_ret.fillna(0)
 
-    # マクロ指標
     macro_cols = [
         'N225_Return', 'N225_Return_5d', 'N225_Trend', 'Growth_Return', 'Growth_Trend',
         'SP500_Return', 'USDJPY_Return', 'VIX_Level', 'US10Y_Return'
@@ -502,11 +492,9 @@ else:
             combined_train[col] = 0.0
             combined_latest[col] = 0.0
 
-    # ニュース感情指標
     combined_train['News_Sentiment'] = 0.0
     combined_latest['News_Sentiment'] = current_news_sentiment
 
-    # 相対リターン
     combined_train['Relative_Return'] = combined_train['Return'] - combined_train['N225_Return'].fillna(0)
     combined_latest['Relative_Return'] = combined_latest['Return'] - combined_latest['N225_Return'].fillna(0)
     combined_train['Relative_Return_5d'] = combined_train['Return_5d'] - combined_train['N225_Return_5d'].fillna(0)
@@ -518,7 +506,6 @@ else:
     combined_train = combined_train.replace([np.inf, -np.inf], np.nan).fillna(train_means).fillna(0)
     combined_latest = combined_latest.replace([np.inf, -np.inf], np.nan).fillna(train_means).fillna(0)
 
-    # フィードバック学習
     sample_weights = np.ones(len(combined_train))
     combined_train['Past_Hit_Rate'] = 0.5
     combined_latest['Past_Hit_Rate'] = 0.5
@@ -591,8 +578,9 @@ else:
     ranking['TP_Str'] = ranking['Take_Profit'].apply(lambda x: f"{x:,}円 (+2.0%)")
     ranking['SL_Str'] = ranking['Stop_Loss'].apply(lambda x: f"{x:,}円 (-1.5%)")
 
+    tag = "【Dry-run 参考値】" if is_dry_run else "【AI厳選】"
     print("\n" + "="*110)
-    print("🔥 【AI厳選】3,000円未満・精密トリプルバリア推奨トレードプラン (上位15選)")
+    print(f"🔥 {tag} 3,000円未満・精密トリプルバリア推奨トレードプラン (上位15選)")
     print("="*110)
     print(f"{'順位':<4} {'コード':<8} {'銘柄名':<16} {'業種':<12} {'現在値':<9} {'AI勝率':<7} {'5日騰落':<8} {'出来高倍':<8} {'利確目標(+2.0%)':<16} {'損切り(-1.5%)':<14}")
     print("-"*110)
@@ -605,8 +593,13 @@ else:
     print("="*110)
 
     save_cols = ['Ticker', 'Name', 'Sector', 'Close', 'AI_Win_Probability', 'Target_Buy', 'Take_Profit', 'Stop_Loss']
-    ranking[save_cols].to_csv('ai_ranking_with_prices.csv', index=False)
-    print("\n📁 最新ランキングを 'ai_ranking_with_prices.csv' に保存しました。")
+    
+    if is_dry_run:
+        ranking[save_cols].to_csv('ai_ranking_dry_run.csv', index=False)
+        print("\n📁 [Dry-run] テスト結果を 'ai_ranking_dry_run.csv' に保存しました（本番ファイルは保護）。")
+    else:
+        ranking[save_cols].to_csv('ai_ranking_with_prices.csv', index=False)
+        print("\n📁 本番最新ランキングを 'ai_ranking_with_prices.csv' に保存しました。")
 
     today_log = ranking[save_cols].head(15).copy()
     today_log['Date'] = today_str
@@ -655,10 +648,14 @@ if len(hit_evaluated) > 0:
     print("="*105)
 
 # =====================================================================
-# 3. Markdownレポート（GitHub Actionsサマリー）の生成（必ず実行）
+# 3. Markdownレポート（GitHub Actionsサマリー）の生成
 # =====================================================================
 sentiment_desc = "強気 (リスクオン)" if current_news_sentiment > 0.1 else ("弱気 (リスクオフ・警戒)" if current_news_sentiment < -0.1 else "中立")
-md_lines = [f"# 📊 AI株価予測 検証レポート (最終更新: {today_str})\n"]
+header_note = " ⚠️ [Dry-run テスト出力]" if is_dry_run else ""
+md_lines = [f"# 📊 AI株価予測 検証レポート (最終更新: {today_str}){header_note}\n"]
+
+if is_dry_run:
+    md_lines.append("> ⚠️ **Dry-runモードで実行されました（16:00前の途中経過データ）。**  \n> 本番履歴ファイル（`ai_prediction_history.csv`）の更新はスキップされています。\n")
 
 if not macro_df.empty:
     latest_m = macro_df.iloc[-1]
@@ -702,22 +699,26 @@ with open(report_file, 'w', encoding='utf-8') as f:
     f.write(report_content)
 print(f"\n📝 詳細検証レポートを '{report_file}' に出力しました。")
 
-if 'GITHUB_STEP_SUMMARY' in os.environ:
+# 本番実行時のみ GitHub Step Summary に書き込む
+if 'GITHUB_STEP_SUMMARY' in os.environ and not is_dry_run:
     with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as f:
         f.write(report_content + "\n")
 
 # =====================================================================
-# 4. 履歴ファイル（ai_prediction_history.csv）の更新
+# 4. 履歴ファイル（ai_prediction_history.csv）の更新（本番実行時のみ）
 # =====================================================================
-if not today_log.empty:
-    if not history_df.empty:
-        history_df = history_df[history_df['Date'] != today_str]
-        updated_history = pd.concat([history_df, today_log], ignore_index=True)
-        updated_history.to_csv(history_file, index=False)
-    else:
-        today_log.to_csv(history_file, index=False)
-    print(f"本日の予測データが {history_file} に正常に蓄積されました。")
+if is_dry_run:
+    print("\n🛑 [Dry-run Guard] 16:00前の実行であるため、ai_prediction_history.csv の更新を完全にスキップしました。")
 else:
-    if not history_df.empty:
-        history_df.to_csv(history_file, index=False)
-    print("本日は新規推奨銘柄がないため、予測履歴の新規追加はありません（検証結果のみ更新保存完了）。")
+    if not today_log.empty:
+        if not history_df.empty:
+            history_df = history_df[history_df['Date'] != today_str]
+            updated_history = pd.concat([history_df, today_log], ignore_index=True)
+            updated_history.to_csv(history_file, index=False)
+        else:
+            today_log.to_csv(history_file, index=False)
+        print(f"本日の予測データが {history_file} に正常に蓄積されました。")
+    else:
+        if not history_df.empty:
+            history_df.to_csv(history_file, index=False)
+        print("本日は新規推奨銘柄がないため、予測履歴の新規追加はありません（検証結果のみ更新保存完了）。")
