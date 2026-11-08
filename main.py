@@ -121,7 +121,7 @@ def fetch_jquants_fundamentals(tickers, api_key):
         time.sleep(0.12)
     return fund_dict
 
-# --- 事前処理1: 過去の予測履歴の検証（安全なトリプルバリア答え合わせ） ---
+# --- 事前処理1: 過去の予測履歴の検証（安全なトリプルバリア答え合わせ・完全版） ---
 history_file = 'ai_prediction_history.csv'
 report_file = 'prediction_report.md'
 newly_verified_indices = []
@@ -137,7 +137,11 @@ if os.path.exists(history_file):
     if 'Sector' not in history_df.columns:
         history_df['Sector'] = history_df['Ticker'].map(sector_map).fillna('-')
         
-    mask = history_df['Actual_Close_Next'].isna() & (history_df['Date'] < today_str)
+    # 修正ポイント: 過去に誤って「-」のまま 0 判定されてしまったレコードも再検証対象に含める
+    mask = (history_df['Date'] < today_str) & (
+        history_df['Actual_Close_Next'].isna() | 
+        history_df['Max_Up_Pct'].isna()
+    )
     print(f"🔍 検証対象となる過去の予測データ数: {mask.sum()} 件")
     
     if mask.sum() > 0:
@@ -148,7 +152,10 @@ if os.path.exists(history_file):
             base_close = float(row['Close'])
             
             try:
-                df_check = yf.download(ticker, start=pred_date, progress=False)
+                # 余裕を持って7日前から取得
+                start_dt = (datetime.strptime(pred_date, '%Y-%m-%d') - timedelta(days=7)).strftime('%Y-%m-%d')
+                df_check = yf.download(ticker, start=start_dt, progress=False)
+                
                 if isinstance(df_check.columns, pd.MultiIndex):
                     df_check.columns = df_check.columns.droplevel(1)
                 
@@ -156,25 +163,28 @@ if os.path.exists(history_file):
                 if df_check.empty:
                     continue
 
-                df_check.index = pd.to_datetime(df_check.index).strftime('%Y-%m-%d')
+                # タイムゾーンを排除して 'YYYY-MM-DD' 形式に統一
+                df_check.index = pd.to_datetime(df_check.index).tz_localize(None).strftime('%Y-%m-%d')
+                
+                # 予測日より厳密に「未来の営業日」を抽出
                 df_future = df_check[df_check.index > pred_date]
                 
-                # 翌営業日の有効なデータが存在するか厳格に確認
                 if not df_future.empty:
                     next_day = df_future.iloc[0]
                     next_close = float(next_day['Close'])
                     next_high = float(next_day['High'])
                     next_low = float(next_day['Low'])
                     
-                    # 取得値が不正（NaNまたは0）な場合はスキップして誤判定を防ぐ
+                    # 異常値チェック（値が取れていない、または0以下の場合は保留）
                     if np.isnan(next_close) or np.isnan(next_high) or np.isnan(next_low) or next_close <= 0:
                         continue
 
+                    # 騰落率の計算
                     ret_pct = ((next_close - base_close) / base_close) * 100
                     max_up_pct = ((next_high - base_close) / base_close) * 100
                     max_down_pct = ((next_low - base_close) / base_close) * 100
                     
-                    # トリプルバリア判定
+                    # トリプルバリア判定（利確+2.0% かつ 損切り-1.5%回避）
                     is_hit = 1 if (next_high >= base_close * 1.02 and next_low > base_close * 0.985) else 0
                     
                     history_df.loc[idx, 'Actual_Close_Next'] = round(next_close, 1)
@@ -183,10 +193,10 @@ if os.path.exists(history_file):
                     history_df.loc[idx, 'Max_Down_Pct'] = round(max_down_pct, 2)
                     history_df.loc[idx, 'Is_Hit'] = is_hit
                     newly_verified_indices.append(idx)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"⚠️ {ticker} の検証スキップ: {e}")
             
-            time.sleep(0.5)
+            time.sleep(0.3)
                 
         history_df.to_csv(history_file, index=False)
         print(f"   ➔ 新たに {len(newly_verified_indices)} 件の確定した答え合わせが完了しました。")
