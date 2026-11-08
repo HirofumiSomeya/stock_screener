@@ -43,8 +43,33 @@ print(f"抽出完了: 全上場企業 {len(valid_tickers)} 銘柄をスクリー
 
 # --- 日本時間（JST）での日付取得 ---
 JST = timezone(timedelta(hours=9))
-today_str = datetime.now(JST).strftime('%Y-%m-%d')
-print(f"📅 本日の実行日 (JST): {today_str}")
+now_jst = datetime.now(JST)
+today_str = now_jst.strftime('%Y-%m-%d')
+print(f"📅 本日の実行日 (JST): {today_str} ({now_jst.strftime('%A')})")
+
+# =====================================================================
+# 🛡️ 改善点1: 東証営業日・祝日判定（土日および市場休業日スキップ）
+# =====================================================================
+# 土日判定
+if now_jst.weekday() >= 5:
+    print(f"🛑 本日は週末（土曜/日曜）のため東証は休場です。スクリーニング処理をスキップします。")
+    exit(0)
+
+# 祝日・休場日判定（日経平均の直近取引日から東証が開いていたか確認）
+try:
+    check_n225 = yf.download('^N225', period='5d', progress=False)
+    if isinstance(check_n225.columns, pd.MultiIndex):
+        check_n225.columns = check_n225.columns.droplevel(1)
+    check_n225.index = pd.to_datetime(check_n225.index).tz_localize(None).strftime('%Y-%m-%d')
+    latest_market_date = check_n225.index[-1]
+    
+    # 夕方17時以降の実行で、日経平均の最新日付が今日でない場合は祝日・休場日
+    if now_jst.hour >= 16 and latest_market_date != today_str:
+        print(f"🛑 本日 ({today_str}) は東証の休場日・祝日です（直近取引日: {latest_market_date}）。")
+        print(f"   ➔ 不正な重複予測の生成を防ぐため、本日のスクリーニング処理を安全に終了します。")
+        exit(0)
+except Exception as e:
+    print(f"⚠️ 市場営業日チェック警告 (処理を継続します): {e}")
 
 # --- 📰 経済・海外情勢ニュース センチメント分析ヘルパー ---
 def fetch_market_news_sentiment():
@@ -121,7 +146,43 @@ def fetch_jquants_fundamentals(tickers, api_key):
         time.sleep(0.12)
     return fund_dict
 
-# --- 事前処理1: 過去の予測履歴の検証（安全なトリプルバリア答え合わせ・完全版） ---
+# =====================================================================
+# 🛡️ 改善点2: 先着順序・始値・終値の位置関係を反映した精密トリプルバリア関数
+# =====================================================================
+def evaluate_triple_barrier(base_close, next_open, next_high, next_low, next_close):
+    """
+    翌日ザラ場の値動きから、利確(+2.0%)と損切り(-1.5%)の先着順序を推定して正確に判定する
+    """
+    tp_price = base_close * 1.02   # 利確ライン (+2.0%)
+    sl_price = base_close * 0.985  # 損切りライン (-1.5%)
+    
+    # 1. 寄り付き（始値）でのギャップアップ/ギャップダウン即時判定
+    if next_open >= tp_price:
+        return 1  # 寄り付きで即利確達成
+    if next_open <= sl_price:
+        return 0  # 寄り付きで即ロスカット発生
+
+    reached_tp = (next_high >= tp_price)
+    reached_sl = (next_low <= sl_price)
+
+    # 2. 明確な単独到達判定
+    if reached_tp and not reached_sl:
+        return 1  # 利確にのみ到達（完全な勝ち）
+    if reached_sl and not reached_tp:
+        return 0  # 損切りにのみ到達（完全な負け）
+    if not reached_tp and not reached_sl:
+        return 0  # どちらにも届かず（未達・負け）
+
+    # 3. 両方のバリアに引っかかった場合（高値+2.0%超 かつ 安値-1.5%割れ）
+    # 終値の勢い（陽線引けか陰線引けか）と始値からの距離で先着を判定
+    if next_close >= base_close:
+        # 上昇優勢で引けている場合、先に利確を達成した可能性が極めて高い
+        return 1
+    else:
+        # 崩れて陰線で引けている場合、先に急落・損切りにかかった可能性が高い
+        return 0
+
+# --- 事前処理1: 過去の予測履歴の検証 ---
 history_file = 'ai_prediction_history.csv'
 report_file = 'prediction_report.md'
 newly_verified_indices = []
@@ -137,7 +198,6 @@ if os.path.exists(history_file):
     if 'Sector' not in history_df.columns:
         history_df['Sector'] = history_df['Ticker'].map(sector_map).fillna('-')
         
-    # 修正ポイント: 過去に誤って「-」のまま 0 判定されてしまったレコードも再検証対象に含める
     mask = (history_df['Date'] < today_str) & (
         history_df['Actual_Close_Next'].isna() | 
         history_df['Max_Up_Pct'].isna()
@@ -145,47 +205,42 @@ if os.path.exists(history_file):
     print(f"🔍 検証対象となる過去の予測データ数: {mask.sum()} 件")
     
     if mask.sum() > 0:
-        print("\n🔍 過去の予測結果の検証（トリプルバリア法：利確+2.0%/損切-1.5%）を実行中...")
+        print("\n🔍 過去の予測結果の検証（精密トリプルバリア法：利確+2.0%/損切-1.5%）を実行中...")
         for idx, row in history_df[mask].iterrows():
             ticker = row['Ticker']
             pred_date = str(row['Date']).strip()
             base_close = float(row['Close'])
             
             try:
-                # 余裕を持って7日前から取得
                 start_dt = (datetime.strptime(pred_date, '%Y-%m-%d') - timedelta(days=7)).strftime('%Y-%m-%d')
                 df_check = yf.download(ticker, start=start_dt, progress=False)
                 
                 if isinstance(df_check.columns, pd.MultiIndex):
                     df_check.columns = df_check.columns.droplevel(1)
                 
-                df_check = df_check.dropna(subset=['Close', 'High', 'Low'])
+                df_check = df_check.dropna(subset=['Open', 'Close', 'High', 'Low'])
                 if df_check.empty:
                     continue
 
-                # タイムゾーンを排除して 'YYYY-MM-DD' 形式に統一
                 df_check.index = pd.to_datetime(df_check.index).tz_localize(None).strftime('%Y-%m-%d')
-                
-                # 予測日より厳密に「未来の営業日」を抽出
                 df_future = df_check[df_check.index > pred_date]
                 
                 if not df_future.empty:
                     next_day = df_future.iloc[0]
+                    next_open = float(next_day['Open'])
                     next_close = float(next_day['Close'])
                     next_high = float(next_day['High'])
                     next_low = float(next_day['Low'])
                     
-                    # 異常値チェック（値が取れていない、または0以下の場合は保留）
                     if np.isnan(next_close) or np.isnan(next_high) or np.isnan(next_low) or next_close <= 0:
                         continue
 
-                    # 騰落率の計算
                     ret_pct = ((next_close - base_close) / base_close) * 100
                     max_up_pct = ((next_high - base_close) / base_close) * 100
                     max_down_pct = ((next_low - base_close) / base_close) * 100
                     
-                    # トリプルバリア判定（利確+2.0% かつ 損切り-1.5%回避）
-                    is_hit = 1 if (next_high >= base_close * 1.02 and next_low > base_close * 0.985) else 0
+                    # 🎯 精密トリプルバリア判定
+                    is_hit = evaluate_triple_barrier(base_close, next_open, next_high, next_low, next_close)
                     
                     history_df.loc[idx, 'Actual_Close_Next'] = round(next_close, 1)
                     history_df.loc[idx, 'Return_Pct'] = round(ret_pct, 2)
@@ -244,8 +299,8 @@ for attempt in range(3):
 
 time.sleep(2.0)
 
-# --- 第1段階: スクリーニング & モメンタムフィルター ---
-print(f"\n第1段階: 株価3000円未満・順張りモメンタム・出来高活況銘柄をスクリーニング中...")
+# --- 第1段階: スクリーニング（緩和版：押し目許容・出来高0.6倍基準） ---
+print(f"\n第1段階: 株価3000円未満・順張り＆健全な押し目銘柄をスクリーニング中...")
 uptrend_data = []
 latest_features = []
 passed_tickers = []
@@ -275,23 +330,23 @@ for i in tqdm(range(0, len(valid_tickers), chunk_size)):
                 if ticker not in bulk_data.columns.levels[0]: continue
                 df = bulk_data[ticker].copy()
                 
-            df = df.dropna(subset=['Close', 'High', 'Low', 'Volume'])
+            df = df.dropna(subset=['Open', 'Close', 'High', 'Low', 'Volume'])
             if df.empty or len(df) < 100: continue
             
             # 3,000円未満フィルター
             if df['Close'].iloc[-1] >= 3000:
                 continue
                 
-            # 移動平均線（短期5日・中期25日・長期75日）
+            # 移動平均線
             df['SMA5'] = df['Close'].rolling(window=5).mean()
             df['SMA25'] = df['Close'].rolling(window=25).mean()
             df['SMA75'] = df['Close'].rolling(window=75).mean()
 
             latest = df.iloc[-1]
-            if pd.isna(latest['SMA25']) or pd.isna(latest['SMA5']):
+            if pd.isna(latest['SMA25']):
                 continue
             
-            # 出来高倍率と週次リターン
+            # 出来高倍率と直近騰落率
             vol_ma20 = df['Volume'].rolling(window=20).mean()
             df['Volume_Ratio'] = df['Volume'] / (vol_ma20 + 1e-8)
             df['Return_5d'] = df['Close'].pct_change(5)
@@ -299,18 +354,14 @@ for i in tqdm(range(0, len(valid_tickers), chunk_size)):
             latest_ret5d = latest['Return_5d'] if pd.notna(latest['Return_5d']) else 0.0
             latest_vol_ratio = latest['Volume_Ratio'] if pd.notna(latest['Volume_Ratio']) else 1.0
 
-            # 🛡️ 調整後フィルター（中期トレンド維持 ＋ 深い暴落株のみを排除）
-            # 1. 25日線の上にある（中期上昇基調）
-            # 2. 75日線が存在する場合は75日線の上（長期トレンド崩れを排除）
-            # 3. 5日騰落率が -3.5% 以上（急落・崩壊中のナイフを排除し、浅い押し目は拾う）
-            # 4. 出来高倍率が 0.6倍 以上（極端な閑散株・過疎株を排除）
+            # 🛡️ 緩和版スクリーニング条件
             sma75_ok = (latest['Close'] > latest['SMA75']) if pd.notna(latest['SMA75']) else True
             
             is_valid_trend = (
                 (latest['Close'] > latest['SMA25']) and
                 sma75_ok and
-                (latest_ret5d >= -0.035) and
-                (latest_vol_ratio >= 0.6)
+                (latest_ret5d >= -0.05) and        # -5%以内の健全な押し目を許容
+                (latest_vol_ratio >= 0.6)          # 過疎株のみを排除（0.6倍以上）
             )
             if not is_valid_trend:
                 continue
@@ -355,14 +406,26 @@ for i in tqdm(range(0, len(valid_tickers), chunk_size)):
             loss5 = (-delta.where(delta < 0, 0)).rolling(window=5).mean()
             df['RSI_5'] = 100 - (100 / (1 + gain5 / (loss5 + 1e-8)))
             
-            # トリプルバリア正解ラベル
+            # 🎯 学習用の正解ラベル（精密トリプルバリア法）
+            next_open = df['Open'].shift(-1)
             next_high = df['High'].shift(-1)
             next_low = df['Low'].shift(-1)
+            next_close = df['Close'].shift(-1)
             curr_close = df['Close']
             
-            hit_tp = (next_high >= curr_close * 1.02)
-            avoid_sl = (next_low > curr_close * 0.985)
-            df['Target'] = (hit_tp & avoid_sl).astype(int)
+            tp_price = curr_close * 1.02
+            sl_price = curr_close * 0.985
+            
+            # 条件分岐ラベル化
+            target_series = pd.Series(0, index=df.index)
+            # 1. 寄り付き上抜け
+            target_series[next_open >= tp_price] = 1
+            # 2. 単独利確
+            target_series[(next_high >= tp_price) & (next_low > sl_price)] = 1
+            # 3. 両方到達時は陽線引け（終値 >= 当日終値）なら利確先行とみなす
+            target_series[(next_high >= tp_price) & (next_low <= sl_price) & (next_close >= curr_close)] = 1
+            
+            df['Target'] = target_series
             
             df = df.replace([np.inf, -np.inf], np.nan).dropna().copy()
             if df.empty: continue
@@ -388,8 +451,8 @@ ranking = pd.DataFrame()
 today_log = pd.DataFrame()
 
 if not uptrend_data:
-    print("\n⚠️ 本日のスクリーニング通過銘柄は 0 社でした。")
-    print("   ➔ 市場全体の地合い悪化または急落警戒のため、本日は【見送り（ノーポジション）】と判定します。")
+    print("\n⚠️ 緩和条件でもスクリーニング通過銘柄は 0 社でした。")
+    print("   ➔ 市場全体の急落警戒のため、本日は【見送り（ノーポジション）】と判定します。")
 else:
     combined_train = pd.concat(uptrend_data)
     combined_latest = pd.concat(latest_features)
@@ -498,7 +561,7 @@ else:
     ]
     X_train, y_train = combined_train[features], combined_train['Target']
     
-    print("\n第2段階: AI学習（過学習抑制・トリプルバリア法・順張りモメンタム）実行中...")
+    print("\n第2段階: AI学習（過学習抑制・精密トリプルバリア法・押し目対応）実行中...")
     lgb_model = lgb.LGBMClassifier(
         n_estimators=250, learning_rate=0.015, max_depth=3,
         subsample=0.8, colsample_bytree=0.8,
@@ -529,7 +592,7 @@ else:
     ranking['SL_Str'] = ranking['Stop_Loss'].apply(lambda x: f"{x:,}円 (-1.5%)")
 
     print("\n" + "="*110)
-    print("🔥 【AI厳選】3,000円未満・順張りモメンタム＆トリプルバリア推奨トレードプラン (上位15選)")
+    print("🔥 【AI厳選】3,000円未満・精密トリプルバリア推奨トレードプラン (上位15選)")
     print("="*110)
     print(f"{'順位':<4} {'コード':<8} {'銘柄名':<16} {'業種':<12} {'現在値':<9} {'AI勝率':<7} {'5日騰落':<8} {'出来高倍':<8} {'利確目標(+2.0%)':<16} {'損切り(-1.5%)':<14}")
     print("-"*110)
@@ -563,11 +626,11 @@ ver_title = ""
 if len(hit_evaluated) > 0:
     if newly_verified_indices:
         target_ver_df = history_df.loc[newly_verified_indices]
-        ver_title = "今回確定した予測の答え合わせ (トリプルバリア判定)"
+        ver_title = "今回確定した予測の答え合わせ (精密トリプルバリア判定)"
     else:
         latest_ver_date = hit_evaluated['Date'].max()
         target_ver_df = hit_evaluated[hit_evaluated['Date'] == latest_ver_date]
-        ver_title = f"直近検証日 ({latest_ver_date}) の答え合わせ (トリプルバリア判定)"
+        ver_title = f"直近検証日 ({latest_ver_date}) の答え合わせ (精密トリプルバリア判定)"
 
     print("\n" + "="*105)
     print(f"🎯 【{ver_title}】個別銘柄の勝敗結果")
@@ -607,7 +670,7 @@ if not macro_df.empty:
     md_lines.append(f"- **ドル円変動率**: {latest_m['USDJPY_Return']*100:+.2f}% | **VIX指数**: {latest_m['VIX_Level']:.1f}\n")
 
 if len(hit_evaluated) > 0:
-    md_lines.append("## 1. 累計パフォーマンス（トリプルバリア法：利確+2.0%/損切-1.5%）")
+    md_lines.append("## 1. 累計パフォーマンス（精密トリプルバリア法：利確+2.0%/損切-1.5%）")
     md_lines.append(f"- **累計検証数**: {total_count} 銘柄（{total_hits}勝 {total_count - total_hits}敗）")
     md_lines.append(f"- **トリプルバリア達成率**: **{total_acc:.1f}%**")
     md_lines.append(f"- **翌日終値平均騰落率**: **{avg_ret:+.2f}%**\n")
@@ -655,7 +718,6 @@ if not today_log.empty:
         today_log.to_csv(history_file, index=False)
     print(f"本日の予測データが {history_file} に正常に蓄積されました。")
 else:
-    # 0件の日でも、答え合わせの更新分を保存
     if not history_df.empty:
         history_df.to_csv(history_file, index=False)
     print("本日は新規推奨銘柄がないため、予測履歴の新規追加はありません（検証結果のみ更新保存完了）。")
