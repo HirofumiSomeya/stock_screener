@@ -303,7 +303,7 @@ for attempt in range(3):
 
 time.sleep(2.0)
 
-# --- 第1段階: スクリーニング（緩和版：押し目許容・出来高0.6倍基準） ---
+# --- 第1段階: スクリーニング（バグ修正・ロバスト版） ---
 print(f"\n第1段階: 株価4000円未満・順張り＆健全な押し目銘柄をスクリーニング中...")
 uptrend_data = []
 latest_features = []
@@ -326,20 +326,34 @@ for i in tqdm(range(0, len(valid_tickers), chunk_size)):
         time.sleep(5)
         continue
         
-    try:
-        for ticker in chunk:
+    for ticker in chunk:
+        try:
+            # 1. カラムの切り出しとMultiIndex安全解除
             if len(chunk) == 1:
                 df = bulk_data.copy()
             else:
-                if ticker not in bulk_data.columns.levels[0]: continue
+                if ticker not in bulk_data.columns.levels[0]:
+                    continue
                 df = bulk_data[ticker].copy()
-                
-            df = df.dropna(subset=['Open', 'Close', 'High', 'Low', 'Volume'])
-            if df.empty or len(df) < 100: continue
+
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.droplevel(1)
+
+            # 必須カラムの存在チェック
+            required_cols = ['Open', 'Close', 'High', 'Low', 'Volume']
+            if not all(col in df.columns for col in required_cols):
+                continue
+
+            df = df.dropna(subset=required_cols)
+            if len(df) < 80:  # 最低80営業日
+                continue
             
-            if df['Close'].iloc[-1] >= 4000:
+            latest_price = float(df['Close'].iloc[-1])
+            # 4,000円未満フィルター
+            if latest_price >= 4000:
                 continue
                 
+            # 移動平均線の算出
             df['SMA5'] = df['Close'].rolling(window=5).mean()
             df['SMA25'] = df['Close'].rolling(window=25).mean()
             df['SMA75'] = df['Close'].rolling(window=75).mean()
@@ -348,24 +362,30 @@ for i in tqdm(range(0, len(valid_tickers), chunk_size)):
             if pd.isna(latest['SMA25']):
                 continue
             
+            # 出来高倍率と直近騰落率
             vol_ma20 = df['Volume'].rolling(window=20).mean()
             df['Volume_Ratio'] = df['Volume'] / (vol_ma20 + 1e-8)
             df['Return_5d'] = df['Close'].pct_change(5)
 
-            latest_ret5d = latest['Return_5d'] if pd.notna(latest['Return_5d']) else 0.0
-            latest_vol_ratio = latest['Volume_Ratio'] if pd.notna(latest['Volume_Ratio']) else 1.0
+            latest_close = float(latest['Close'])
+            latest_sma25 = float(latest['SMA25'])
+            latest_sma75 = float(latest['SMA75']) if pd.notna(latest['SMA75']) else -np.inf
+            latest_ret5d = float(latest['Return_5d']) if pd.notna(latest['Return_5d']) else 0.0
+            latest_vol_ratio = float(latest['Volume_Ratio']) if pd.notna(latest['Volume_Ratio']) else 1.0
 
-            sma75_ok = (latest['Close'] > latest['SMA75']) if pd.notna(latest['SMA75']) else True
+            # 🛡️ 判定条件（明確な数値比較）
+            sma75_ok = (latest_close > latest_sma75) if pd.notna(latest['SMA75']) else True
             
             is_valid_trend = (
-                (latest['Close'] > latest['SMA25']) and
+                (latest_close > latest_sma25) and
                 sma75_ok and
-                (latest_ret5d >= -0.05) and
-                (latest_vol_ratio >= 0.6)
+                (latest_ret5d >= -0.06) and        # -6%以内の押し目を許容
+                (latest_vol_ratio >= 0.5)          # 出来高0.5倍以上
             )
             if not is_valid_trend:
                 continue
                 
+            # 特徴量生成
             df['Return'] = df['Close'].pct_change()
             df['Return_3d'] = df['Close'].pct_change(3)
             df['Return_20d'] = df['Close'].pct_change(20)
@@ -377,7 +397,6 @@ for i in tqdm(range(0, len(valid_tickers), chunk_size)):
             df['Vol_Regime'] = vol_5d / (vol_20d + 1e-8)
             
             df['Volume_Change'] = df['Volume'].pct_change()
-            
             df['SMA5_Dev'] = (df['Close'] / df['SMA5']) - 1
             df['SMA25_Dev'] = (df['Close'] / df['SMA25']) - 1
             df['SMA75_Dev'] = (df['Close'] / df['SMA75']) - 1
@@ -405,36 +424,43 @@ for i in tqdm(range(0, len(valid_tickers), chunk_size)):
             loss5 = (-delta.where(delta < 0, 0)).rolling(window=5).mean()
             df['RSI_5'] = 100 - (100 / (1 + gain5 / (loss5 + 1e-8)))
             
-            next_open = df['Open'].shift(-1)
-            next_high = df['High'].shift(-1)
-            next_low = df['Low'].shift(-1)
-            next_close = df['Close'].shift(-1)
-            curr_close = df['Close']
+            df['Date_Str'] = pd.to_datetime(df.index).strftime('%Y-%m-%d')
+            df['Ticker'] = ticker
+
+            # ⚠️ 修正ポイント: 最新行（今日）を dropna 前に安全に切り出す
+            latest_row = df.iloc[-1:].copy()
+            if latest_row.isna().sum().sum() > 5: # 欠損が多すぎる場合は除外
+                continue
+
+            # 学習データ（過去データのみ翌日ターゲットを計算）
+            train_df = df.iloc[:-1].copy()
+            next_open = df['Open'].shift(-1).iloc[:-1]
+            next_high = df['High'].shift(-1).iloc[:-1]
+            next_low = df['Low'].shift(-1).iloc[:-1]
+            next_close = df['Close'].shift(-1).iloc[:-1]
+            curr_close = train_df['Close']
             
             tp_price = curr_close * 1.02
             sl_price = curr_close * 0.985
             
-            target_series = pd.Series(0, index=df.index)
+            target_series = pd.Series(0, index=train_df.index)
             target_series[next_open >= tp_price] = 1
             target_series[(next_high >= tp_price) & (next_low > sl_price)] = 1
             target_series[(next_high >= tp_price) & (next_low <= sl_price) & (next_close >= curr_close)] = 1
+            train_df['Target'] = target_series
             
-            df['Target'] = target_series
-            
-            df = df.replace([np.inf, -np.inf], np.nan).dropna().copy()
-            if df.empty: continue
-            
-            df['Date_Str'] = pd.to_datetime(df.index).strftime('%Y-%m-%d')
-            df['Ticker'] = ticker
-            
-            uptrend_data.append(df[:-1])
-            latest_features.append(df.iloc[-1:])
+            train_df = train_df.replace([np.inf, -np.inf], np.nan).dropna()
+            if len(train_df) < 50:
+                continue
+
+            uptrend_data.append(train_df)
+            latest_features.append(latest_row)
             passed_tickers.append(ticker)
+
+        except Exception as e:
+            continue
             
-    except Exception:
-        continue
-        
-    time.sleep(random.uniform(1.0, 2.0))
+    time.sleep(random.uniform(0.5, 1.0))
 
 print(f"\nスクリーニング通過: {len(passed_tickers)} 社")
 
