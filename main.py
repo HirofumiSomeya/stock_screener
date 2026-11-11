@@ -304,7 +304,7 @@ for attempt in range(3):
 time.sleep(2.0)
 
 # --- 第1段階: スクリーニング（緩和版：押し目許容・出来高0.6倍基準） ---
-print(f"\n第1段階: 株価3000円未満・順張り＆健全な押し目銘柄をスクリーニング中...")
+print(f"\n第1段階: 株価4000円未満・順張り＆健全な押し目銘柄をスクリーニング中...")
 uptrend_data = []
 latest_features = []
 passed_tickers = []
@@ -337,7 +337,7 @@ for i in tqdm(range(0, len(valid_tickers), chunk_size)):
             df = df.dropna(subset=['Open', 'Close', 'High', 'Low', 'Volume'])
             if df.empty or len(df) < 100: continue
             
-            if df['Close'].iloc[-1] >= 3000:
+            if df['Close'].iloc[-1] >= 4000:
                 continue
                 
             df['SMA5'] = df['Close'].rolling(window=5).mean()
