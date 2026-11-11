@@ -64,12 +64,10 @@ else:
 # =====================================================================
 # 🛡️ 安全ガード2: 東証営業日・祝日判定（土日および市場休業日スキップ）
 # =====================================================================
-# 土日判定
 if now_jst.weekday() >= 5:
     print(f"🛑 本日は週末（土曜/日曜）のため東証は休場です。スクリーニング処理をスキップします。")
     exit(0)
 
-# 祝日・休場日判定（日経平均の直近取引日から東証が開いていたか確認）
 try:
     check_n225 = yf.download('^N225', period='5d', progress=False)
     if isinstance(check_n225.columns, pd.MultiIndex):
@@ -303,184 +301,169 @@ for attempt in range(3):
 
 time.sleep(2.0)
 
-# --- 第1段階: スクリーニング（順序バグ修正・ロバスト版） ---
-print(
-    f"\n第1段階: 株価4000円未満・順張り＆健全な押し目銘柄をスクリーニング中..."
-)
+# --- 第1段階: スクリーニング（順序バグ修正・過熱株除外フィルター搭載） ---
+print(f"\n第1段階: 株価4000円未満・順張り＆健全な押し目銘柄をスクリーニング中...")
 uptrend_data = []
 latest_features = []
 passed_tickers = []
 
 chunk_size = 30
 for i in tqdm(range(0, len(valid_tickers), chunk_size)):
-  chunk = valid_tickers[i : i + chunk_size]
-
-  success = False
-  for attempt in range(3):
-    try:
-      bulk_data = yf.download(
-          chunk, period="2y", interval="1d", progress=False, group_by="ticker"
-      )
-      success = True
-      break
-    except Exception:
-      time.sleep(3 * (attempt + 1))
-
-  if not success:
-    time.sleep(5)
-    continue
-
-  for ticker in chunk:
-    try:
-      if len(chunk) == 1:
-        df = bulk_data.copy()
-      else:
-        if ticker not in bulk_data.columns.levels[0]:
-          continue
-        df = bulk_data[ticker].copy()
-
-      if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.droplevel(1)
-
-      required_cols = ["Open", "Close", "High", "Low", "Volume"]
-      if not all(col in df.columns for col in required_cols):
+    chunk = valid_tickers[i:i + chunk_size]
+    
+    success = False
+    for attempt in range(3):
+        try:
+            bulk_data = yf.download(chunk, period="2y", interval="1d", progress=False, group_by='ticker')
+            success = True
+            break
+        except Exception:
+            time.sleep(3 * (attempt + 1))
+            
+    if not success:
+        time.sleep(5)
         continue
+        
+    for ticker in chunk:
+        try:
+            if len(chunk) == 1:
+                df = bulk_data.copy()
+            else:
+                if ticker not in bulk_data.columns.levels[0]: continue
+                df = bulk_data[ticker].copy()
 
-      df = df.dropna(subset=required_cols)
-      if len(df) < 80:
-        continue
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.droplevel(1)
 
-      latest_price = float(df["Close"].iloc[-1])
-      if latest_price >= 4000:
-        continue
+            required_cols = ['Open', 'Close', 'High', 'Low', 'Volume']
+            if not all(col in df.columns for col in required_cols):
+                continue
 
-      # -------------------------------------------------------------
-      # 1. 先にすべての指標・騰落率・出来高倍率を df 上で計算する
-      # -------------------------------------------------------------
-      df["SMA5"] = df["Close"].rolling(window=5).mean()
-      df["SMA25"] = df["Close"].rolling(window=25).mean()
-      df["SMA75"] = df["Close"].rolling(window=75).mean()
+            df = df.dropna(subset=required_cols)
+            if len(df) < 80:
+                continue
 
-      vol_ma20 = df["Volume"].rolling(window=20).mean()
-      df["Volume_Ratio"] = df["Volume"] / (vol_ma20 + 1e-8)
-      df["Return_5d"] = df["Close"].pct_change(5)
+            latest_price = float(df['Close'].iloc[-1])
+            # 🛡️ ボロ株（100円未満）および4,000円以上の除外
+            if latest_price < 100 or latest_price >= 4000:
+                continue
 
-      # -------------------------------------------------------------
-      # 2. 全指標の計算完了後に `latest` を切り出す（KeyError解消）
-      # -------------------------------------------------------------
-      latest = df.iloc[-1]
-      if pd.isna(latest["SMA25"]):
-        continue
+            # -------------------------------------------------------------
+            # 指標・騰落率・出来高倍率を df 上で先に計算
+            # -------------------------------------------------------------
+            df['SMA5'] = df['Close'].rolling(window=5).mean()
+            df['SMA25'] = df['Close'].rolling(window=25).mean()
+            df['SMA75'] = df['Close'].rolling(window=75).mean()
 
-      latest_close = float(latest["Close"])
-      latest_sma25 = float(latest["SMA25"])
-      latest_sma75 = (
-          float(latest["SMA75"]) if pd.notna(latest["SMA75"]) else -np.inf
-      )
-      latest_ret5d = (
-          float(latest["Return_5d"]) if pd.notna(latest["Return_5d"]) else 0.0
-      )
-      latest_vol_ratio = (
-          float(latest["Volume_Ratio"])
-          if pd.notna(latest["Volume_Ratio"])
-          else 1.0
-      )
+            vol_ma20 = df['Volume'].rolling(window=20).mean()
+            df['Volume_Ratio'] = df['Volume'] / (vol_ma20 + 1e-8)
+            df['Return_5d'] = df['Close'].pct_change(5)
 
-      # 🛡️ 判定条件（押し目・出来高フィルター）
-      sma75_ok = (latest_close > latest_sma75) if pd.notna(latest["SMA75"]) else True
-      is_valid_trend = (
-          (latest_close > latest_sma25)
-          and sma75_ok
-          and (latest_ret5d >= -0.06)  # -6%以内の押し目を許容
-          and (latest_vol_ratio >= 0.5)  # 出来高0.5倍以上
-      )
-      if not is_valid_trend:
-        continue
+            # -------------------------------------------------------------
+            # 全指標の計算完了後に `latest` を安全に切り出し
+            # -------------------------------------------------------------
+            latest = df.iloc[-1]
+            if pd.isna(latest['SMA25']):
+                continue
 
-      # -------------------------------------------------------------
-      # 3. AI学習用の特徴量生成
-      # -------------------------------------------------------------
-      df["Return"] = df["Close"].pct_change()
-      df["Return_3d"] = df["Close"].pct_change(3)
-      df["Return_20d"] = df["Close"].pct_change(20)
-      df["Return_60d"] = df["Close"].pct_change(60)
+            latest_close = float(latest['Close'])
+            latest_sma25 = float(latest['SMA25'])
+            latest_sma75 = float(latest['SMA75']) if pd.notna(latest['SMA75']) else -np.inf
+            latest_ret5d = float(latest['Return_5d']) if pd.notna(latest['Return_5d']) else 0.0
+            latest_vol_ratio = float(latest['Volume_Ratio']) if pd.notna(latest['Volume_Ratio']) else 1.0
 
-      vol_5d = df["Return"].rolling(window=5).std()
-      df["Volatility"] = df["Return"].rolling(window=10).std()
-      vol_20d = df["Return"].rolling(window=20).std()
-      df["Vol_Regime"] = vol_5d / (vol_20d + 1e-8)
+            # 🛡️ 判定条件:
+            # 1. 25日線より上（中期トレンド維持）
+            # 2. 75日線より上（長期下落トレンド除外）
+            # 3. 5日騰落率が -6.0% 〜 +25.0%（深すぎる暴落と、天井圏の過熱暴騰株の両方を除外）
+            # 4. 出来高倍率 0.5倍以上（過疎株除外）
+            sma75_ok = (latest_close > latest_sma75) if pd.notna(latest['SMA75']) else True
+            is_valid_trend = (
+                (latest_close > latest_sma25) and
+                sma75_ok and
+                (-0.06 <= latest_ret5d <= 0.25) and
+                (latest_vol_ratio >= 0.5)
+            )
+            if not is_valid_trend:
+                continue
 
-      df["Volume_Change"] = df["Volume"].pct_change()
-      df["SMA5_Dev"] = (df["Close"] / df["SMA5"]) - 1
-      df["SMA25_Dev"] = (df["Close"] / df["SMA25"]) - 1
-      df["SMA75_Dev"] = (df["Close"] / df["SMA75"]) - 1
+            # -------------------------------------------------------------
+            # AI学習用の特徴量生成
+            # -------------------------------------------------------------
+            df['Return'] = df['Close'].pct_change()
+            df['Return_3d'] = df['Close'].pct_change(3)
+            df['Return_20d'] = df['Close'].pct_change(20)
+            df['Return_60d'] = df['Close'].pct_change(60)
 
-      ema12 = df["Close"].ewm(span=12, adjust=False).mean()
-      ema26 = df["Close"].ewm(span=26, adjust=False).mean()
-      macd = ema12 - ema26
-      macd_sig = macd.ewm(span=9, adjust=False).mean()
-      df["MACD_Hist"] = (macd - macd_sig) / (df["Close"] + 1e-8)
+            vol_5d = df['Return'].rolling(window=5).std()
+            df['Volatility'] = df['Return'].rolling(window=10).std()
+            vol_20d = df['Return'].rolling(window=20).std()
+            df['Vol_Regime'] = vol_5d / (vol_20d + 1e-8)
 
-      high_60 = df["High"].rolling(window=60).max()
-      low_60 = df["Low"].rolling(window=60).min()
-      df["Range_60d_Pos"] = (df["Close"] - low_60) / (high_60 - low_60 + 1e-8)
+            df['Volume_Change'] = df['Volume'].pct_change()
+            df['SMA5_Dev'] = (df['Close'] / df['SMA5']) - 1
+            df['SMA25_Dev'] = (df['Close'] / df['SMA25']) - 1
+            df['SMA75_Dev'] = (df['Close'] / df['SMA75']) - 1
 
-      sma20 = df["Close"].rolling(window=20).mean()
-      std20 = df["Close"].rolling(window=20).std()
-      df["BB_Pos"] = (df["Close"] - sma20) / (2 * std20 + 1e-8)
+            ema12 = df['Close'].ewm(span=12, adjust=False).mean()
+            ema26 = df['Close'].ewm(span=26, adjust=False).mean()
+            macd = ema12 - ema26
+            macd_sig = macd.ewm(span=9, adjust=False).mean()
+            df['MACD_Hist'] = (macd - macd_sig) / (df['Close'] + 1e-8)
 
-      delta = df["Close"].diff()
-      gain14 = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-      loss14 = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-      df["RSI"] = 100 - (100 / (1 + gain14 / (loss14 + 1e-8)))
+            high_60 = df['High'].rolling(window=60).max()
+            low_60 = df['Low'].rolling(window=60).min()
+            df['Range_60d_Pos'] = (df['Close'] - low_60) / (high_60 - low_60 + 1e-8)
 
-      gain5 = (delta.where(delta > 0, 0)).rolling(window=5).mean()
-      loss5 = (-delta.where(delta < 0, 0)).rolling(window=5).mean()
-      df["RSI_5"] = 100 - (100 / (1 + gain5 / (loss5 + 1e-8)))
+            sma20 = df['Close'].rolling(window=20).mean()
+            std20 = df['Close'].rolling(window=20).std()
+            df['BB_Pos'] = (df['Close'] - sma20) / (2 * std20 + 1e-8)
 
-      df["Date_Str"] = pd.to_datetime(df.index).strftime("%Y-%m-%d")
-      df["Ticker"] = ticker
+            delta = df['Close'].diff()
+            gain14 = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss14 = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            df['RSI'] = 100 - (100 / (1 + gain14 / (loss14 + 1e-8)))
 
-      # 本日行を安全に確保
-      latest_row = df.iloc[-1:].copy()
-      if latest_row.isna().sum().sum() > 5:
-        continue
+            gain5 = (delta.where(delta > 0, 0)).rolling(window=5).mean()
+            loss5 = (-delta.where(delta < 0, 0)).rolling(window=5).mean()
+            df['RSI_5'] = 100 - (100 / (1 + gain5 / (loss5 + 1e-8)))
 
-      # 過去学習データの正解ラベル付与
-      train_df = df.iloc[:-1].copy()
-      next_open = df["Open"].shift(-1).iloc[:-1]
-      next_high = df["High"].shift(-1).iloc[:-1]
-      next_low = df["Low"].shift(-1).iloc[:-1]
-      next_close = df["Close"].shift(-1).iloc[:-1]
-      curr_close = train_df["Close"]
+            df['Date_Str'] = pd.to_datetime(df.index).strftime('%Y-%m-%d')
+            df['Ticker'] = ticker
 
-      tp_price = curr_close * 1.02
-      sl_price = curr_close * 0.985
+            latest_row = df.iloc[-1:].copy()
+            if latest_row.isna().sum().sum() > 5:
+                continue
 
-      target_series = pd.Series(0, index=train_df.index)
-      target_series[next_open >= tp_price] = 1
-      target_series[(next_high >= tp_price) & (next_low > sl_price)] = 1
-      target_series[
-          (next_high >= tp_price)
-          & (next_low <= sl_price)
-          & (next_close >= curr_close)
-      ] = 1
-      train_df["Target"] = target_series
+            # 過去学習データの正解ラベル付与
+            train_df = df.iloc[:-1].copy()
+            next_open = df['Open'].shift(-1).iloc[:-1]
+            next_high = df['High'].shift(-1).iloc[:-1]
+            next_low = df['Low'].shift(-1).iloc[:-1]
+            next_close = df['Close'].shift(-1).iloc[:-1]
+            curr_close = train_df['Close']
 
-      train_df = train_df.replace([np.inf, -np.inf], np.nan).dropna()
-      if len(train_df) < 50:
-        continue
+            tp_price = curr_close * 1.02
+            sl_price = curr_close * 0.985
 
-      uptrend_data.append(train_df)
-      latest_features.append(latest_row)
-      passed_tickers.append(ticker)
+            target_series = pd.Series(0, index=train_df.index)
+            target_series[next_open >= tp_price] = 1
+            target_series[(next_high >= tp_price) & (next_low > sl_price)] = 1
+            target_series[(next_high >= tp_price) & (next_low <= sl_price) & (next_close >= curr_close)] = 1
+            train_df['Target'] = target_series
 
-    except Exception as e:
-      # 例外発生時に原因が確認できるようログを出力
-      # print(f"⚠️ {ticker} スキップ理由: {e}")
-      continue
+            train_df = train_df.replace([np.inf, -np.inf], np.nan).dropna()
+            if len(train_df) < 50:
+                continue
 
-  time.sleep(random.uniform(0.3, 0.6))
+            uptrend_data.append(train_df)
+            latest_features.append(latest_row)
+            passed_tickers.append(ticker)
+
+        except Exception:
+            continue
+
+    time.sleep(random.uniform(0.3, 0.6))
 
 print(f"\nスクリーニング通過: {len(passed_tickers)} 社")
 
@@ -496,13 +479,13 @@ if not uptrend_data:
 else:
     combined_train = pd.concat(uptrend_data)
     combined_latest = pd.concat(latest_features)
-    
+
     jq_api_key = get_jquants_api_key()
     if jq_api_key:
         jq_fund = fetch_jquants_fundamentals(passed_tickers, jq_api_key)
         eps_map = {k: v['EPS'] for k, v in jq_fund.items()}
         bps_map = {k: v['BPS'] for k, v in jq_fund.items()}
-        
+
         for df_part in [combined_train, combined_latest]:
             eps_s = df_part['Ticker'].map(eps_map)
             bps_s = df_part['Ticker'].map(bps_map)
@@ -522,7 +505,7 @@ else:
 
     sector_daily_ret = combined_train.groupby(['Date_Str', 'Sector_Code'])['Return'].transform('mean')
     combined_train['Sector_Return'] = sector_daily_ret.fillna(0)
-    
+
     latest_sec_ret = combined_latest.groupby('Sector_Code')['Return'].transform('mean')
     combined_latest['Sector_Return'] = latest_sec_ret.fillna(0)
 
@@ -552,6 +535,7 @@ else:
     combined_train = combined_train.replace([np.inf, -np.inf], np.nan).fillna(train_means).fillna(0)
     combined_latest = combined_latest.replace([np.inf, -np.inf], np.nan).fillna(train_means).fillna(0)
 
+    # 🛡️ 改善: ペナルティ重みを 3.0 ➔ 1.5 へ緩和（過剰な弱気バイアスをリセット）
     sample_weights = np.ones(len(combined_train))
     combined_train['Past_Hit_Rate'] = 0.5
     combined_latest['Past_Hit_Rate'] = 0.5
@@ -560,26 +544,26 @@ else:
         verified_df = history_df.dropna(subset=['Is_Hit']).copy()
         if len(verified_df) > 0:
             print(f"\n🧠 過去の検証データ（{len(verified_df)}件）をAIの学習へフィードバック中...")
-            
+
             ticker_stats = verified_df.groupby('Ticker')['Is_Hit'].agg(['count', 'sum'])
             ticker_stats['smoothed_rate'] = (ticker_stats['sum'] + 1.0) / (ticker_stats['count'] + 2.0)
             rate_map = ticker_stats['smoothed_rate'].to_dict()
-            
+
             combined_train['Past_Hit_Rate'] = combined_train['Ticker'].map(rate_map).fillna(0.5)
             combined_latest['Past_Hit_Rate'] = combined_latest['Ticker'].map(rate_map).fillna(0.5)
-            
+
             verified_outcome_map = verified_df.set_index(['Ticker', 'Date'])['Is_Hit'].to_dict()
             train_keys = list(zip(combined_train['Ticker'], combined_train['Date_Str']))
-            
+
             matched_misses = 0
             for idx_w, key in enumerate(train_keys):
                 if key in verified_outcome_map:
                     if verified_outcome_map[key] == 0:
-                        sample_weights[idx_w] = 3.0
+                        sample_weights[idx_w] = 1.5  # 3.0倍から1.5倍へマイルド化
                         matched_misses += 1
                     else:
-                        sample_weights[idx_w] = 1.5
-            print(f"   ➔ 過去の失敗パターン {matched_misses} 件にペナルティ重み（x3.0）を適用しました。")
+                        sample_weights[idx_w] = 1.2
+            print(f"   ➔ 過去の失敗パターン {matched_misses} 件に適度なペナルティ重み（x1.5）を適用しました。")
 
     features = [
         'Return', 'Return_3d', 'Return_5d', 'Return_20d', 'Return_60d',
@@ -593,8 +577,8 @@ else:
         'News_Sentiment'
     ]
     X_train, y_train = combined_train[features], combined_train['Target']
-    
-    print("\n第2段階: AI学習（過学習抑制・精密トリプルバリア法・押し目対応）実行中...")
+
+    print("\n第2段階: AI学習（過学習抑制・健全モメンタム重視）実行中...")
     lgb_model = lgb.LGBMClassifier(
         n_estimators=250, learning_rate=0.015, max_depth=3,
         subsample=0.8, colsample_bytree=0.8,
@@ -604,18 +588,18 @@ else:
 
     X_latest = combined_latest[features]
     combined_latest['AI_Win_Probability'] = lgb_model.predict_proba(X_latest)[:, 1]
-    
+
     ranking = combined_latest[['Ticker', 'Close', 'AI_Win_Probability', 'Volume_Ratio', 'RSI', 'Return_5d', 'Return_20d']].copy()
     ranking['Name'] = ranking['Ticker'].map(name_map).fillna('-')
     ranking['Sector'] = ranking['Ticker'].map(sector_map).fillna('-')
-    
+
     ranking = ranking.sort_values(by='AI_Win_Probability', ascending=False).reset_index(drop=True)
     ranking.index = ranking.index + 1
-    
+
     ranking['Target_Buy'] = ranking['Close'].round(0).astype(int)
     ranking['Take_Profit'] = (ranking['Close'] * 1.02).round(0).astype(int)
     ranking['Stop_Loss'] = (ranking['Close'] * 0.985).round(0).astype(int)
-    
+
     ranking['AI_Win_Probability_Str'] = (ranking['AI_Win_Probability'] * 100).round(1).astype(str) + '%'
     ranking['Close_Str'] = ranking['Close'].round(0).astype(int).apply(lambda x: f"{x:,}円")
     ranking['Vol_Ratio_Str'] = ranking['Volume_Ratio'].round(1).astype(str) + '倍'
@@ -626,7 +610,7 @@ else:
 
     tag = "【Dry-run 参考値】" if is_dry_run else "【AI厳選】"
     print("\n" + "="*110)
-    print(f"🔥 {tag} 3,000円未満・精密トリプルバリア推奨トレードプラン (上位15選)")
+    print(f"🔥 {tag} 100〜4,000円・初動＆健全押し目推奨トレードプラン (上位15選)")
     print("="*110)
     print(f"{'順位':<4} {'コード':<8} {'銘柄名':<16} {'業種':<12} {'現在値':<9} {'AI勝率':<7} {'5日騰落':<8} {'出来高倍':<8} {'利確目標(+2.0%)':<16} {'損切り(-1.5%)':<14}")
     print("-"*110)
@@ -639,7 +623,7 @@ else:
     print("="*110)
 
     save_cols = ['Ticker', 'Name', 'Sector', 'Close', 'AI_Win_Probability', 'Target_Buy', 'Take_Profit', 'Stop_Loss']
-    
+
     if is_dry_run:
         ranking[save_cols].to_csv('ai_ranking_dry_run.csv', index=False)
         print("\n📁 [Dry-run] テスト結果を 'ai_ranking_dry_run.csv' に保存しました（本番ファイルは保護）。")
@@ -717,7 +701,7 @@ if len(hit_evaluated) > 0:
     md_lines.append(f"- **累計検証数**: {total_count} 銘柄（{total_hits}勝 {total_count - total_hits}敗）")
     md_lines.append(f"- **トリプルバリア達成率**: **{total_acc:.1f}%**")
     md_lines.append(f"- **翌日終値平均騰落率**: **{avg_ret:+.2f}%**\n")
-    
+
     if not target_ver_df.empty:
         md_lines.append(f"## 2. {ver_title}")
         md_lines.append("| 予測日 | コード | 銘柄名 | 業種 | AI勝率 | 基準終値 | ザラ場最高 | ザラ場最安 | 判定 |")
@@ -745,7 +729,6 @@ with open(report_file, 'w', encoding='utf-8') as f:
     f.write(report_content)
 print(f"\n📝 詳細検証レポートを '{report_file}' に出力しました。")
 
-# 本番実行時のみ GitHub Step Summary に書き込む
 if 'GITHUB_STEP_SUMMARY' in os.environ and not is_dry_run:
     with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as f:
         f.write(report_content + "\n")
